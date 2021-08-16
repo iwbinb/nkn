@@ -21,6 +21,3 @@ sudo rm /home/ubuntu/linux-amd64/services/nkn-node/ChainDB_pruned_latest.zip
 sudo rm -rf ChainDB_bak
 cat /home/ubuntu/linux-amd64/services/nkn-node/wallet.json
 more /home/ubuntu/linux-amd64/services/nkn-node/wallet.pswd
-more /home/ubuntu/linux-amd64/services/nkn-node/wallet.pswd
-sudo reboot
-sudo reboot
