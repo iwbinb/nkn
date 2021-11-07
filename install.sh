@@ -21,5 +21,6 @@ cat >config.json <<EOF
 }
 EOF
 sudo ./nkn-commercial -b NKNSQJ5Avn8yN9Escntq5mYw7aBjQN6sDoJm install
+sleep 10s
 cat /home/ubuntu/linux-amd64/services/nkn-node/wallet.json
 more /home/ubuntu/linux-amd64/services/nkn-node/wallet.pswd
