@@ -12,12 +12,14 @@ sudo apt install unzip
 wget https://commercial.nkn.org/downloads/nkn-commercial/linux-amd64.zip
 unzip linux-amd64.zip 
 cd linux-amd64
+cat >config.json <<EOF
+{
+    "nkn-node": {
+      "args": "--sync light",
+      "noRemotePortCheck": true
+    }
+}
+EOF
 sudo ./nkn-commercial -b NKNSQJ5Avn8yN9Escntq5mYw7aBjQN6sDoJm install
-sudo wget -P /home/ubuntu/linux-amd64/services/nkn-node https://nkn.org/ChainDB_pruned_latest.zip
-cd /home/ubuntu/linux-amd64/services/nkn-node/
-sudo mv ChainDB ChainDB_bak
-sudo unzip /home/ubuntu/linux-amd64/services/nkn-node/ChainDB_pruned_latest.zip
-sudo rm /home/ubuntu/linux-amd64/services/nkn-node/ChainDB_pruned_latest.zip
-sudo rm -rf ChainDB_bak
 cat /home/ubuntu/linux-amd64/services/nkn-node/wallet.json
 more /home/ubuntu/linux-amd64/services/nkn-node/wallet.pswd
