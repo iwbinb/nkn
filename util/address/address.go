@@ -4,11 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net"
-	"net/url"
 	"strings"
 
-	"github.com/nknorg/nkn/common"
-	"github.com/nknorg/nkn/util/log"
+	"github.com/nknorg/nkn/v2/util/log"
 )
 
 var privateIPBlocks []*net.IPNet
@@ -44,7 +42,7 @@ func MakeAddressString(pubKey []byte, identifier string) string {
 		result.WriteString(identifier)
 		result.WriteString(".")
 	}
-	result.WriteString(common.BytesToHexString(pubKey))
+	result.WriteString(hex.EncodeToString(pubKey))
 
 	return result.String()
 }
@@ -70,24 +68,9 @@ func ParseClientAddress(addrStr string) ([]byte, []byte, string, error) {
 // AssembleClientAddress returns the client address string from identifier and
 // pubkey
 func AssembleClientAddress(identifier string, pubkey []byte) string {
-	return identifier + "." + hex.EncodeToString(pubkey)
-}
-
-// ShouldRejectAddr returns if remoteAddr should be rejected by localAddr
-func ShouldRejectAddr(localAddr, remoteAddr string) bool {
-	localAddress, err := url.Parse(localAddr)
-	if err != nil {
-		return false
+	addr := hex.EncodeToString(pubkey)
+	if len(identifier) > 0 {
+		addr = identifier + "." + addr
 	}
-
-	remoteAddress, err := url.Parse(remoteAddr)
-	if err != nil {
-		return false
-	}
-
-	if localAddress.Hostname() != remoteAddress.Hostname() && localAddress.Port() != remoteAddress.Port() {
-		return true
-	}
-
-	return false
+	return addr
 }

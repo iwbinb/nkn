@@ -1,19 +1,7 @@
 syntax = "proto3";
+option go_package = "./pb";
 
 package pb;
-
-import "github.com/gogo/protobuf/gogoproto/gogo.proto";
-
-option (gogoproto.gostring_all) = true;
-option (gogoproto.goproto_stringer_all) = false;
-option (gogoproto.stringer_all) = true;
-option (gogoproto.marshaler_all) = true;
-option (gogoproto.sizer_all) = true;
-option (gogoproto.unmarshaler_all) = true;
-
-option (gogoproto.testgen_all) = true;
-option (gogoproto.equal_all) = true;
-option (gogoproto.populate_all) = true;
 
 enum SyncState {
   WAIT_FOR_SYNCING = 0;
@@ -27,4 +15,8 @@ message NodeData {
   uint32 websocket_port = 2;
   uint32 json_rpc_port = 3;
   uint32 protocol_version = 4;
+  string tls_websocket_domain = 5;
+  uint32 tls_websocket_port = 6;
+  string tls_json_rpc_domain = 7;
+  uint32 tls_json_rpc_port = 8;
 }

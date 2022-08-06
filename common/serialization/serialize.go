@@ -1,7 +1,6 @@
 package serialization
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -67,7 +66,7 @@ func WriteDataList(w io.Writer, list []SerializableData) error {
 
 func WriteVarUint(writer io.Writer, value uint64) error {
 	var buf [9]byte
-	var len = 0
+	len := 0
 	if value < 0xFD {
 		buf[0] = uint8(value)
 		len = 1
@@ -254,12 +253,6 @@ func WriteUint64(writer io.Writer, val uint64) error {
 	binary.LittleEndian.PutUint64(p[:], val)
 	_, err := writer.Write(p[:])
 	return err
-}
-
-func ToArray(data SerializableData) []byte {
-	b_buf := new(bytes.Buffer)
-	data.Serialize(b_buf)
-	return b_buf.Bytes()
 }
 
 //**************************************************************************

@@ -2,11 +2,21 @@ package trie
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 
-	"github.com/nknorg/nkn/common/serialization"
+	"github.com/nknorg/nkn/v2/common/serialization"
+	"github.com/nknorg/nkn/v2/util/log"
+)
+
+const (
+	TagHashNode        = 0
+	TagValueNode       = 1
+	TagShortNode       = 2
+	TagFullNode        = 17
+	LenOfChildrenNodes = 17
 )
 
 var indices = []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f", "[17]"}
@@ -19,7 +29,7 @@ type node interface {
 
 type (
 	fullNode struct {
-		Children [17]node // Actual trie node data to encode/decode (needs custom encoder)
+		Children [LenOfChildrenNodes]node // Actual trie node data to encode/decode (needs custom encoder)
 		flags    nodeFlag
 	}
 	shortNode struct {
@@ -66,13 +76,16 @@ func (n *fullNode) fString(ind string) string {
 }
 
 func (n *shortNode) fString(ind string) string {
-	return fmt.Sprintf("{%v: %v} ", n.Key, n.Val.fString(ind+"  "))
+	return fmt.Sprintf("{%v: %v} ", hex.EncodeToString(n.Key), n.Val.fString(ind+"  "))
+
 }
 func (n hashNode) fString(ind string) string {
-	return fmt.Sprintf("<%x>", []byte(n))
+	return fmt.Sprintf("<%s>", hex.EncodeToString(n))
+
 }
 func (n valueNode) fString(ind string) string {
-	return fmt.Sprintf("%s", string(n))
+	return fmt.Sprintf("%s", hex.EncodeToString(n))
+
 }
 
 func (n *fullNode) String() string {
@@ -93,25 +106,25 @@ type nodeFlag struct {
 	dirty bool
 }
 
-func mustDecodeNode(hash, buf []byte) node {
-	n, err := decodeNode(hash, buf)
+func mustDecodeNode(hash, buf []byte, needFlags bool) node {
+	n, err := decodeNode(hash, buf, needFlags)
 	if err != nil {
-		panic(fmt.Sprintf("node %x, %v", hash, err))
+		log.Fatalf("Trie node %x decode error: %v", hash, err)
 	}
 	return n
 }
 
-func decodeNode(hash, buf []byte) (node, error) {
+func decodeNode(hash, buf []byte, needFlags bool) (node, error) {
 	if len(buf) == 0 {
 		return nil, io.ErrUnexpectedEOF
 	}
 
 	buff := bytes.NewBuffer(buf)
-	return Deserialize(buff)
+	return Deserialize(hash, buff, needFlags)
 }
 
 func (n *fullNode) Serialize(w io.Writer) error {
-	if err := serialization.WriteVarUint(w, uint64(17)); err != nil {
+	if err := serialization.WriteVarUint(w, uint64(TagFullNode)); err != nil {
 		return err
 	}
 
@@ -119,18 +132,6 @@ func (n *fullNode) Serialize(w io.Writer) error {
 		if err := serialization.WriteVarUint(w, uint64(idx)); err != nil {
 			return err
 		}
-
-		//if ns == nil {
-		//	panic("=-----hadhaslfd")
-		//	if err := serialization.WriteVarUint(w, uint64(20)); err != nil {
-		//		return err
-		//	}
-		//	u256 := ToHash256(nil)
-		//	if err := serialization.WriteVarBytes(w, u256); err != nil {
-		//		return err
-		//	}
-		//	continue
-		//}
 		if err := ns.Serialize(w); err != nil {
 			return err
 		}
@@ -140,24 +141,12 @@ func (n *fullNode) Serialize(w io.Writer) error {
 }
 
 func (n *shortNode) Serialize(w io.Writer) error {
-	if err := serialization.WriteVarUint(w, uint64(2)); err != nil {
+	if err := serialization.WriteVarUint(w, uint64(TagShortNode)); err != nil {
 		return err
 	}
 	if err := serialization.WriteVarBytes(w, n.Key); err != nil {
 		return err
 	}
-	//if n.Val == nil {
-	//	panic("=-----hadhaslfd")
-	//	if err := serialization.WriteVarUint(w, uint64(20)); err != nil {
-	//		return err
-	//	}
-	//	u256 := ToHash256(nil)
-	//	if err := serialization.WriteVarBytes(w, u256); err != nil {
-	//		return err
-	//	}
-	//	return nil
-	//}
-
 	if err := n.Val.Serialize(w); err != nil {
 		return err
 	}
@@ -165,7 +154,7 @@ func (n *shortNode) Serialize(w io.Writer) error {
 }
 
 func (n hashNode) Serialize(w io.Writer) error {
-	if err := serialization.WriteVarUint(w, uint64(0)); err != nil {
+	if err := serialization.WriteVarUint(w, uint64(TagHashNode)); err != nil {
 		return err
 	}
 	if err := serialization.WriteVarBytes(w, []byte(n)); err != nil {
@@ -176,7 +165,7 @@ func (n hashNode) Serialize(w io.Writer) error {
 }
 
 func (n valueNode) Serialize(w io.Writer) error {
-	if err := serialization.WriteVarUint(w, uint64(1)); err != nil {
+	if err := serialization.WriteVarUint(w, uint64(TagValueNode)); err != nil {
 		return err
 	}
 
@@ -187,20 +176,20 @@ func (n valueNode) Serialize(w io.Writer) error {
 	return nil
 }
 
-func Deserialize(r io.Reader) (node, error) {
+func Deserialize(hash []byte, r io.Reader, needFlags bool) (node, error) {
 	count, err := serialization.ReadVarUint(r, 20)
 	if err != nil {
 		return nil, err
 	}
 
 	switch count {
-	case 0:
+	case TagHashNode:
 		buff, err := serialization.ReadVarBytes(r)
 		if err != nil {
 			return nil, err
 		}
 		return hashNode(buff), nil
-	case 1:
+	case TagValueNode:
 		buff, err := serialization.ReadVarBytes(r)
 		if err != nil {
 			return nil, err
@@ -211,7 +200,7 @@ func Deserialize(r io.Reader) (node, error) {
 		}
 
 		return valueNode(buff), nil
-	case 2:
+	case TagShortNode:
 		var s shortNode
 		key, err := serialization.ReadVarBytes(r)
 		if err != nil {
@@ -219,14 +208,19 @@ func Deserialize(r io.Reader) (node, error) {
 		}
 		s.Key = compactToHex(key)
 
-		s.Val, err = Deserialize(r)
+		s.Val, err = Deserialize(hash, r, needFlags)
 		if err != nil {
 			return nil, err
 		}
+		if needFlags {
+			s.flags.hash = hashNode(hash)
+			s.flags.dirty = false
+		}
+
 		return &s, nil
-	case 17:
+	case TagFullNode:
 		var f fullNode
-		for i := 0; i < 17; i++ {
+		for i := 0; i < LenOfChildrenNodes; i++ {
 			idx, err := serialization.ReadVarUint(r, 20)
 			if err != nil {
 				return nil, err
@@ -234,26 +228,18 @@ func Deserialize(r io.Reader) (node, error) {
 			if int(idx) != i {
 				return nil, errors.New("idex error")
 			}
-			n, err := Deserialize(r)
+			n, err := Deserialize(hash, r, needFlags)
 			if err != nil {
 				return nil, err
 			}
 			f.Children[i] = n
 		}
+		if needFlags {
+			f.flags.hash = hashNode(hash)
+			f.flags.dirty = false
+		}
 
 		return &f, nil
-		//case 20:
-		//	panic("=-----hadhaslfd")
-		//	u256 := ToHash256(nil)
-		//	hash, err := serialization.ReadVarBytes(r)
-		//	if err != nil {
-		//		return nil, err
-		//	}
-		//	if bytes.Equal(hash, u256) {
-		//		return nil, nil
-		//	}
-
-		//	return nil, errors.New("nil error")
 	}
 
 	return nil, errors.New("errors")

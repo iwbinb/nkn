@@ -1,18 +1,18 @@
 package transaction
 
 import (
-	. "github.com/nknorg/nkn/common"
-	"github.com/nknorg/nkn/crypto/util"
-	"github.com/nknorg/nkn/pb"
+	"github.com/nknorg/nkn/v2/common"
+	"github.com/nknorg/nkn/v2/pb"
+	"github.com/nknorg/nkn/v2/util"
 )
 
 const (
 	TransactionNonceLength = 32
 )
 
-func NewTransferAssetTransaction(sender, recipient Uint160, nonce uint64, value, fee Fixed64) (*Transaction, error) {
+func NewTransferAssetTransaction(sender, recipient common.Uint160, nonce uint64, value, fee common.Fixed64) (*Transaction, error) {
 	payload := NewTransferAsset(sender, recipient, value)
-	pl, err := Pack(pb.TRANSFER_ASSET_TYPE, payload)
+	pl, err := Pack(pb.PayloadType_TRANSFER_ASSET_TYPE, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -24,9 +24,9 @@ func NewTransferAssetTransaction(sender, recipient Uint160, nonce uint64, value,
 	}, nil
 }
 
-func NewSigChainTransaction(sigChain []byte, submitter Uint160, nonce uint64) (*Transaction, error) {
+func NewSigChainTransaction(sigChain []byte, submitter common.Uint160, nonce uint64) (*Transaction, error) {
 	payload := NewSigChainTxn(sigChain, submitter)
-	pl, err := Pack(pb.SIG_CHAIN_TXN_TYPE, payload)
+	pl, err := Pack(pb.PayloadType_SIG_CHAIN_TXN_TYPE, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -38,9 +38,9 @@ func NewSigChainTransaction(sigChain []byte, submitter Uint160, nonce uint64) (*
 	}, nil
 }
 
-func NewRegisterNameTransaction(registrant []byte, name string, nonce uint64, fee Fixed64) (*Transaction, error) {
-	payload := NewRegisterName(registrant, name)
-	pl, err := Pack(pb.REGISTER_NAME_TYPE, payload)
+func NewRegisterNameTransaction(registrant []byte, name string, nonce uint64, regFee common.Fixed64, fee common.Fixed64) (*Transaction, error) {
+	payload := NewRegisterName(registrant, name, int64(regFee))
+	pl, err := Pack(pb.PayloadType_REGISTER_NAME_TYPE, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -52,9 +52,23 @@ func NewRegisterNameTransaction(registrant []byte, name string, nonce uint64, fe
 	}, nil
 }
 
-func NewDeleteNameTransaction(registrant []byte, name string, nonce uint64, fee Fixed64) (*Transaction, error) {
+func NewTransferNameTransaction(registrant []byte, to []byte, name string, nonce uint64, fee common.Fixed64) (*Transaction, error) {
+	payload := NewTransferName(registrant, to, name)
+	pl, err := Pack(pb.PayloadType_TRANSFER_NAME_TYPE, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	tx := NewMsgTx(pl, nonce, fee, util.RandomBytes(TransactionNonceLength))
+
+	return &Transaction{
+		Transaction: tx,
+	}, nil
+}
+
+func NewDeleteNameTransaction(registrant []byte, name string, nonce uint64, fee common.Fixed64) (*Transaction, error) {
 	payload := NewDeleteName(registrant, name)
-	pl, err := Pack(pb.DELETE_NAME_TYPE, payload)
+	pl, err := Pack(pb.PayloadType_DELETE_NAME_TYPE, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -66,9 +80,9 @@ func NewDeleteNameTransaction(registrant []byte, name string, nonce uint64, fee 
 	}, nil
 }
 
-func NewSubscribeTransaction(subscriber []byte, identifier string, topic string, bucket uint32, duration uint32, meta string, nonce uint64, fee Fixed64) (*Transaction, error) {
-	payload := NewSubscribe(subscriber, identifier, topic, bucket, duration, meta)
-	pl, err := Pack(pb.SUBSCRIBE_TYPE, payload)
+func NewSubscribeTransaction(subscriber []byte, identifier string, topic string, duration uint32, meta string, nonce uint64, fee common.Fixed64) (*Transaction, error) {
+	payload := NewSubscribe(subscriber, identifier, topic, duration, meta)
+	pl, err := Pack(pb.PayloadType_SUBSCRIBE_TYPE, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -80,9 +94,9 @@ func NewSubscribeTransaction(subscriber []byte, identifier string, topic string,
 	}, nil
 }
 
-func NewGenerateIDTransaction(publicKey []byte, regFee Fixed64, nonce uint64, fee Fixed64) (*Transaction, error) {
-	payload := NewGenerateID(publicKey, regFee)
-	pl, err := Pack(pb.GENERATE_ID_TYPE, payload)
+func NewUnsubscribeTransaction(subscriber []byte, identifier string, topic string, nonce uint64, fee common.Fixed64) (*Transaction, error) {
+	payload := NewUnsubscribe(subscriber, identifier, topic)
+	pl, err := Pack(pb.PayloadType_UNSUBSCRIBE_TYPE, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -94,9 +108,23 @@ func NewGenerateIDTransaction(publicKey []byte, regFee Fixed64, nonce uint64, fe
 	}, nil
 }
 
-func NewNanoPayTransaction(sender, recipient Uint160, id uint64, amount Fixed64, txnExpiration, nanoPayExpiration uint32) (*Transaction, error) {
+func NewGenerateIDTransaction(publicKey, sender []byte, regFee common.Fixed64, version int32, nonce uint64, fee common.Fixed64, attrs []byte) (*Transaction, error) {
+	payload := NewGenerateID(publicKey, sender, regFee, version)
+	pl, err := Pack(pb.PayloadType_GENERATE_ID_TYPE, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	tx := NewMsgTx(pl, nonce, fee, attrs)
+
+	return &Transaction{
+		Transaction: tx,
+	}, nil
+}
+
+func NewNanoPayTransaction(sender, recipient common.Uint160, id uint64, amount common.Fixed64, txnExpiration, nanoPayExpiration uint32) (*Transaction, error) {
 	payload := NewNanoPay(sender, recipient, id, amount, txnExpiration, nanoPayExpiration)
-	pl, err := Pack(pb.NANO_PAY_TYPE, payload)
+	pl, err := Pack(pb.PayloadType_NANO_PAY_TYPE, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -108,9 +136,9 @@ func NewNanoPayTransaction(sender, recipient Uint160, id uint64, amount Fixed64,
 	}, nil
 }
 
-func NewIssueAssetTransaction(sender Uint160, name, symbol string, totalSupply Fixed64, precision uint32, nonce uint64, fee Fixed64) (*Transaction, error) {
+func NewIssueAssetTransaction(sender common.Uint160, name, symbol string, totalSupply common.Fixed64, precision uint32, nonce uint64, fee common.Fixed64) (*Transaction, error) {
 	payload := NewIssueAsset(sender, name, symbol, precision, totalSupply)
-	pl, err := Pack(pb.ISSUE_ASSET_TYPE, payload)
+	pl, err := Pack(pb.PayloadType_ISSUE_ASSET_TYPE, payload)
 	if err != nil {
 		return nil, err
 	}

@@ -6,24 +6,25 @@ import (
 	"fmt"
 	"hash/fnv"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/nknorg/nkn/block"
-	"github.com/nknorg/nkn/chain"
-	"github.com/nknorg/nkn/chain/pool"
-	"github.com/nknorg/nkn/common"
-	"github.com/nknorg/nkn/crypto/util"
-	"github.com/nknorg/nkn/pb"
-	"github.com/nknorg/nkn/por"
-	"github.com/nknorg/nkn/transaction"
-	"github.com/nknorg/nkn/util/config"
-	"github.com/nknorg/nkn/util/log"
+	"github.com/golang/protobuf/proto"
+	"github.com/nknorg/nkn/v2/block"
+	"github.com/nknorg/nkn/v2/chain"
+	"github.com/nknorg/nkn/v2/chain/pool"
+	"github.com/nknorg/nkn/v2/chain/txvalidator"
+	"github.com/nknorg/nkn/v2/common"
+	"github.com/nknorg/nkn/v2/config"
+	"github.com/nknorg/nkn/v2/pb"
+	"github.com/nknorg/nkn/v2/por"
+	"github.com/nknorg/nkn/v2/transaction"
+	"github.com/nknorg/nkn/v2/util"
+	"github.com/nknorg/nkn/v2/util/log"
 	nnetnode "github.com/nknorg/nnet/node"
 	nnetpb "github.com/nknorg/nnet/protobuf"
 )
 
 const (
 	requestTxnSaltSize                  = 32
-	requestTxnChanLen                   = 1000
+	requestTxnChanLen                   = 10000
 	requestSigChainTxnWorkerPoolSize    = 10
 	requestSigChainCacheExpiration      = 50 * config.ConsensusTimeout
 	requestSigChainCacheCleanupInterval = config.ConsensusDuration
@@ -153,8 +154,8 @@ func (rt *receiveTxnMsg) receiveTxnMsg(txnMsg *pb.Transactions, remoteMessage *n
 }
 
 func (localNode *LocalNode) initTxnHandlers() {
-	localNode.AddMessageHandler(pb.I_HAVE_SIGNATURE_CHAIN_TRANSACTION, localNode.iHaveSignatureChainTransactionMessageHandler)
-	localNode.AddMessageHandler(pb.REQUEST_SIGNATURE_CHAIN_TRANSACTION, localNode.requestSignatureChainTransactionMessageHandler)
+	localNode.AddMessageHandler(pb.MessageType_I_HAVE_SIGNATURE_CHAIN_TRANSACTION, localNode.iHaveSignatureChainTransactionMessageHandler)
+	localNode.AddMessageHandler(pb.MessageType_REQUEST_SIGNATURE_CHAIN_TRANSACTION, localNode.requestSignatureChainTransactionMessageHandler)
 	localNode.startRequestingSigChainTxn()
 	localNode.startReceivingTxnMsg()
 }
@@ -180,32 +181,34 @@ func (localNode *LocalNode) startRequestingSigChainTxn() {
 					continue
 				}
 
-				if !por.GetPorServer().ShouldAddSigChainToCache(chain.DefaultLedger.Store.GetHeight(), info.height, info.hash) {
+				currentHeight := chain.DefaultLedger.Store.GetHeight()
+
+				if !por.GetPorServer().ShouldAddSigChainToCache(currentHeight, info.height, info.hash, false) {
 					continue
 				}
 
-				neighbor = localNode.GetNbrNode(info.neighborID)
+				neighbor = localNode.GetNeighborNode(info.neighborID)
 				if neighbor == nil {
 					continue
 				}
 
 				txn, err = localNode.requestSignatureChainTransaction(neighbor, info.hash)
 				if err != nil {
-					log.Warningf("Request sigchain txn error: %v", err)
+					log.Infof("Request sigchain txn error: %v", err)
 					continue
 				}
 
 				requestedHashCache.Set(info.hash, struct{}{})
 
-				err = chain.VerifyTransaction(txn)
+				err = txvalidator.VerifyTransaction(txn, currentHeight+1)
 				if err != nil {
-					log.Warningf("Verify sigchain txn error: %v", err)
+					log.Infof("Verify sigchain txn error: %v", err)
 					continue
 				}
 
 				porPkg, err = por.GetPorServer().AddSigChainFromTx(txn, chain.DefaultLedger.Store.GetHeight())
 				if err != nil {
-					log.Warningf("Add sigchain from txn error: %v", err)
+					log.Infof("Add sigchain from txn error: %v", err)
 					continue
 				}
 				if porPkg == nil {
@@ -214,8 +217,25 @@ func (localNode *LocalNode) startRequestingSigChainTxn() {
 
 				err = localNode.iHaveSignatureChainTransaction(porPkg.VoteForHeight, porPkg.SigHash, &info.neighborID)
 				if err != nil {
-					log.Warningf("Send I have sigchain txn error: %v", err)
+					log.Infof("Send I have sigchain txn error: %v", err)
 					continue
+				}
+
+				err = localNode.VerifySigChain(porPkg.SigChain, porPkg.Height)
+				if err != nil {
+					log.Infof("Local node verify sigchain failed: %v", err)
+					added := por.GetPorServer().AddSigChainObjection(
+						chain.DefaultLedger.Store.GetHeight(),
+						porPkg.VoteForHeight,
+						porPkg.SigHash,
+						localNode.GetPubKey(),
+					)
+					if added {
+						err = localNode.signatureChainObjection(porPkg.VoteForHeight, porPkg.SigHash)
+						if err != nil {
+							log.Infof("Send sigchain objection error: %v", err)
+						}
+					}
 				}
 			}
 		}(ch)
@@ -234,7 +254,7 @@ func (localNode *LocalNode) startReceivingTxnMsg() {
 
 				shouldPropagate, err = localNode.handleTransactionsMessage(info.txnMsg)
 				if err != nil {
-					log.Warningf("Handle transactions msg error: %v", err)
+					log.Infof("Handle transactions msg error: %v", err)
 					continue
 				}
 
@@ -245,7 +265,7 @@ func (localNode *LocalNode) startReceivingTxnMsg() {
 				for _, remoteNode = range info.nextRemoteNodes {
 					_, err = remoteNode.SendMessage(info.remoteMessage.Msg, false, 0)
 					if err != nil {
-						log.Warningf("Sending txn msg to neighbor %v error: %v", remoteNode, err)
+						log.Infof("Sending txn msg to neighbor %v error: %v", remoteNode, err)
 						continue
 					}
 				}
@@ -271,7 +291,7 @@ func NewTransactionsMessage(transactions []*transaction.Transaction) (*pb.Unsign
 	}
 
 	msg := &pb.UnsignedMessage{
-		MessageType: pb.TRANSACTIONS,
+		MessageType: pb.MessageType_TRANSACTIONS,
 		Message:     buf,
 	}
 
@@ -292,7 +312,7 @@ func NewIHaveSignatureChainTransactionMessage(height uint32, sigHash []byte) (*p
 	}
 
 	msg := &pb.UnsignedMessage{
-		MessageType: pb.I_HAVE_SIGNATURE_CHAIN_TRANSACTION,
+		MessageType: pb.MessageType_I_HAVE_SIGNATURE_CHAIN_TRANSACTION,
 		Message:     buf,
 	}
 
@@ -312,7 +332,7 @@ func NewRequestSignatureChainTransactionMessage(sigHash []byte) (*pb.UnsignedMes
 	}
 
 	msg := &pb.UnsignedMessage{
-		MessageType: pb.REQUEST_SIGNATURE_CHAIN_TRANSACTION,
+		MessageType: pb.MessageType_REQUEST_SIGNATURE_CHAIN_TRANSACTION,
 		Message:     buf,
 	}
 
@@ -333,7 +353,7 @@ func NewRequestSignatureChainTransactionReply(transaction *transaction.Transacti
 	}
 
 	msg := &pb.UnsignedMessage{
-		MessageType: pb.REQUEST_SIGNATURE_CHAIN_TRANSACTION_REPLY,
+		MessageType: pb.MessageType_REQUEST_SIGNATURE_CHAIN_TRANSACTION_REPLY,
 		Message:     buf,
 	}
 
@@ -356,11 +376,10 @@ func (localNode *LocalNode) handleTransactionsMessage(txnMsg *pb.Transactions) (
 		}
 
 		err := localNode.AppendTxnPool(txn)
-		if err == pool.ErrDuplicatedTx {
+		if err == pool.ErrDuplicatedTx || err == pool.ErrRejectLowPriority {
 			return false, nil
 		}
 		if err != nil {
-			log.Warningf("Verify transaction failed when append to txn pool: %v", err)
 			return false, err
 		}
 	}
@@ -377,7 +396,7 @@ func (localNode *LocalNode) iHaveSignatureChainTransactionMessageHandler(remoteM
 		return nil, false, err
 	}
 
-	if !por.GetPorServer().ShouldAddSigChainToCache(chain.DefaultLedger.Store.GetHeight(), msgBody.Height, msgBody.SignatureHash) {
+	if !por.GetPorServer().ShouldAddSigChainToCache(chain.DefaultLedger.Store.GetHeight(), msgBody.Height, msgBody.SignatureHash, false) {
 		return nil, false, nil
 	}
 
@@ -468,7 +487,7 @@ func (localNode *LocalNode) iHaveSignatureChainTransaction(height uint32, sigHas
 		}
 		err = neighbor.SendBytesAsync(buf)
 		if err != nil {
-			log.Errorf("Send vote to neighbor %v error: %v", neighbor, err)
+			log.Infof("Send message to neighbor %v error: %v", neighbor, err)
 			continue
 		}
 	}
@@ -504,7 +523,12 @@ func (localNode *LocalNode) requestSignatureChainTransaction(neighbor *RemoteNod
 
 	txn := &transaction.Transaction{Transaction: replyMsg.Transaction}
 
-	porPkg, err := por.NewPorPackage(txn, false)
+	err = txn.VerifySignature()
+	if err != nil {
+		return nil, err
+	}
+
+	porPkg, err := por.NewPorPackage(txn)
 	if err != nil {
 		return nil, fmt.Errorf("create por package from txn error: %v", err)
 	}
@@ -518,6 +542,8 @@ func (localNode *LocalNode) requestSignatureChainTransaction(neighbor *RemoteNod
 
 func (localNode *LocalNode) cleanupTransactions(v interface{}) {
 	if block, ok := v.(*block.Block); ok {
-		localNode.TxnPool.CleanSubmittedTransactions(block.Transactions)
+		if err := localNode.TxnPool.CleanSubmittedTransactions(block.Transactions); err != nil {
+			log.Errorf("CleanSubmittedTransactions error: %v", err)
+		}
 	}
 }

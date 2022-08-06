@@ -1,23 +1,26 @@
 package block
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 
-	"github.com/gogo/protobuf/proto"
-	. "github.com/nknorg/nkn/common"
-	"github.com/nknorg/nkn/common/serialization"
-	"github.com/nknorg/nkn/crypto"
-	"github.com/nknorg/nkn/pb"
-	"github.com/nknorg/nkn/signature"
-	"github.com/nknorg/nkn/transaction"
-	"github.com/nknorg/nkn/util/config"
+	"github.com/golang/protobuf/proto"
+	"github.com/nknorg/nkn/v2/common"
+	"github.com/nknorg/nkn/v2/common/serialization"
+	"github.com/nknorg/nkn/v2/config"
+	"github.com/nknorg/nkn/v2/crypto"
+	"github.com/nknorg/nkn/v2/pb"
+	"github.com/nknorg/nkn/v2/signature"
+	"github.com/nknorg/nkn/v2/transaction"
 )
 
 type Block struct {
-	Header       *Header
-	Transactions []*transaction.Transaction
+	Header        *Header
+	Transactions  []*transaction.Transaction
+	IsTxnsChecked bool
 }
 
 func (b *Block) FromMsgBlock(msgBlock *pb.Block) {
@@ -60,27 +63,31 @@ func (b *Block) Unmarshal(buf []byte) error {
 func (b *Block) GetTxsSize() int {
 	txnSize := 0
 	for _, txn := range b.Transactions {
-		txnSize += txn.GetSize()
+		txnSize += int(txn.GetSize())
 	}
 
 	return txnSize
 }
 
-func (b *Block) GetSigner() ([]byte, []byte, error) {
-	return b.Header.UnsignedHeader.SignerPk, b.Header.UnsignedHeader.SignerId, nil
-}
-
 func (b *Block) Trim(w io.Writer) error {
-	dt, _ := b.Header.Marshal()
-	serialization.WriteVarBytes(w, dt)
-	err := serialization.WriteUint32(w, uint32(len(b.Transactions)))
+	dt, err := b.Header.Marshal()
 	if err != nil {
-		return fmt.Errorf("Block item Transactions length serialization failed: %v", err)
+		return err
 	}
-	for _, transaction := range b.Transactions {
-		temp := *transaction
-		hash := temp.Hash()
-		hash.Serialize(w)
+	err = serialization.WriteVarBytes(w, dt)
+	if err != nil {
+		return err
+	}
+	err = serialization.WriteUint32(w, uint32(len(b.Transactions)))
+	if err != nil {
+		return err
+	}
+	for _, tx := range b.Transactions {
+		hash := tx.Hash()
+		_, err = hash.Serialize(w)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -99,10 +106,13 @@ func (b *Block) FromTrimmedData(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	var txhash Uint256
-	var tharray []Uint256
+	var txhash common.Uint256
+	var tharray []common.Uint256
 	for i = 0; i < Len; i++ {
-		txhash.Deserialize(r)
+		err = txhash.Deserialize(r)
+		if err != nil {
+			return err
+		}
 		transaction := new(transaction.Transaction)
 		transaction.SetHash(txhash)
 		b.Transactions = append(b.Transactions, transaction)
@@ -127,7 +137,7 @@ func (b *Block) ToArray() []byte {
 	return dt
 }
 
-func (b *Block) GetProgramHashes() ([]Uint160, error) {
+func (b *Block) GetProgramHashes() ([]common.Uint160, error) {
 
 	return b.Header.GetProgramHashes()
 }
@@ -141,7 +151,7 @@ func (b *Block) GetPrograms() []*pb.Program {
 	return b.Header.GetPrograms()
 }
 
-func (b *Block) Hash() Uint256 {
+func (b *Block) Hash() common.Uint256 {
 	return b.Header.Hash()
 }
 
@@ -149,27 +159,27 @@ func (b *Block) Verify() error {
 	return nil
 }
 
-func ComputeID(preBlockHash, txnHash Uint256, randomBeacon []byte) []byte {
+func ComputeID(preBlockHash, txnHash common.Uint256, randomBeacon []byte) []byte {
 	data := append(preBlockHash[:], txnHash[:]...)
 	data = append(data, randomBeacon...)
-	id := crypto.Sha256(data)
-	return id
+	id := sha256.Sum256(data)
+	return id[:]
 }
 
 func GenesisBlockInit() (*Block, error) {
-	genesisSignerPk, err := HexStringToBytes(config.Parameters.GenesisBlockProposer)
+	genesisSignerPk, err := hex.DecodeString(config.Parameters.GenesisBlockProposer)
 	if err != nil {
 		return nil, fmt.Errorf("parse GenesisBlockProposer error: %v", err)
 	}
 
-	genesisSignerID := ComputeID(EmptyUint256, EmptyUint256, config.GenesisBeacon[:config.RandomBeaconUniqueLength])
+	genesisSignerID := ComputeID(common.EmptyUint256, common.EmptyUint256, config.GenesisBeacon[:config.RandomBeaconUniqueLength])
 
 	// block header
 	genesisBlockHeader := &Header{
 		Header: &pb.Header{
 			UnsignedHeader: &pb.UnsignedHeader{
 				Version:       config.HeaderVersion,
-				PrevBlockHash: EmptyUint256.ToArray(),
+				PrevBlockHash: common.EmptyUint256.ToArray(),
 				Timestamp:     config.GenesisTimestamp,
 				Height:        uint32(0),
 				RandomBeacon:  config.GenesisBeacon,
@@ -179,16 +189,16 @@ func GenesisBlockInit() (*Block, error) {
 		},
 	}
 
-	rewardAddress, err := ToScriptHash(config.InitialIssueAddress)
+	rewardAddress, err := common.ToScriptHash(config.InitialIssueAddress)
 	if err != nil {
 		return nil, fmt.Errorf("parse InitialIssueAddress error: %v", err)
 	}
-	donationProgramhash, err := ToScriptHash(config.DonationAddress)
+	donationProgramhash, err := common.ToScriptHash(config.DonationAddress)
 	if err != nil {
 		return nil, fmt.Errorf("parse DonationAddress error: %v", err)
 	}
-	payload := transaction.NewCoinbase(donationProgramhash, rewardAddress, Fixed64(0))
-	pl, err := transaction.Pack(pb.COINBASE_TYPE, payload)
+	payload := transaction.NewCoinbase(donationProgramhash, rewardAddress, common.Fixed64(0))
+	pl, err := transaction.Pack(pb.PayloadType_COINBASE_TYPE, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +225,7 @@ func GenesisBlockInit() (*Block, error) {
 
 func (b *Block) RebuildMerkleRoot() error {
 	txs := b.Transactions
-	transactionHashes := []Uint256{}
+	transactionHashes := []common.Uint256{}
 	for _, tx := range txs {
 		transactionHashes = append(transactionHashes, tx.Hash())
 	}
@@ -248,7 +258,7 @@ func (b *Block) GetInfo() ([]byte, error) {
 	info := &blockInfo{
 		Header:       unmarshaledHeader,
 		Transactions: make([]interface{}, 0),
-		Size:         b.ToMsgBlock().Size(),
+		Size:         proto.Size(b.ToMsgBlock()),
 		Hash:         hash.ToHexString(),
 	}
 

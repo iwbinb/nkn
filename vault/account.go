@@ -3,33 +3,44 @@ package vault
 import (
 	"fmt"
 
-	. "github.com/nknorg/nkn/common"
-	"github.com/nknorg/nkn/crypto"
-	"github.com/nknorg/nkn/program"
+	"github.com/nknorg/nkn/v2/common"
+	"github.com/nknorg/nkn/v2/crypto"
+	"github.com/nknorg/nkn/v2/program"
 )
 
 type Account struct {
 	PrivateKey  []byte
-	PublicKey   *crypto.PubKey
-	ProgramHash Uint160
+	PublicKey   []byte
+	ProgramHash common.Uint160
 }
 
 func NewAccount() (*Account, error) {
-	priKey, pubKey, _ := crypto.GenKeyPair()
+	publicKey, privateKey, err := crypto.GenKeyPair()
+	if err != nil {
+		return nil, err
+	}
 
-	programHash, err := program.CreateProgramHash(&pubKey)
+	programHash, err := program.CreateProgramHash(publicKey)
 	if err != nil {
 		return nil, fmt.Errorf("%v\n%s", err, "New account redeemhash generated failed")
 	}
-	return &Account{
-		PrivateKey:  priKey,
-		PublicKey:   &pubKey,
+
+	account := &Account{
+		PrivateKey:  privateKey,
+		PublicKey:   publicKey,
 		ProgramHash: programHash,
-	}, nil
+	}
+
+	return account, nil
 }
 
-func NewAccountWithPrivatekey(privateKey []byte) (*Account, error) {
-	pubKey := crypto.NewPubKey(privateKey)
+func NewAccountWithSeed(seed []byte) (*Account, error) {
+	if err := crypto.CheckSeed(seed); err != nil {
+		return nil, err
+	}
+
+	privateKey := crypto.GetPrivateKeyFromSeed(seed)
+	pubKey := crypto.GetPublicKeyFromPrivateKey(privateKey)
 	programHash, err := program.CreateProgramHash(pubKey)
 	if err != nil {
 		return nil, fmt.Errorf("%v\n%s", err, "New account redeemhash generated failed")
@@ -46,6 +57,6 @@ func (a *Account) PrivKey() []byte {
 	return a.PrivateKey
 }
 
-func (a *Account) PubKey() *crypto.PubKey {
+func (a *Account) PubKey() []byte {
 	return a.PublicKey
 }

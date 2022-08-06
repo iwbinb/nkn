@@ -4,19 +4,20 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 
-	. "github.com/nknorg/nkn/common"
+	"github.com/nknorg/nkn/v2/common"
 )
 
 var (
-	DOUBLE_SHA256 = func(s []Uint256) Uint256 {
+	DOUBLE_SHA256 = func(s []common.Uint256) common.Uint256 {
 		b := new(bytes.Buffer)
 		for _, d := range s {
 			d.Serialize(b)
 		}
 		temp := sha256.Sum256(b.Bytes())
 		f := sha256.Sum256(temp[:])
-		return Uint256(f)
+		return common.Uint256(f)
 	}
 )
 
@@ -26,7 +27,7 @@ type MerkleTree struct {
 }
 
 type MerkleTreeNode struct {
-	Hash  Uint256
+	Hash  common.Uint256
 	Left  *MerkleTreeNode
 	Right *MerkleTreeNode
 }
@@ -36,7 +37,7 @@ func (t *MerkleTreeNode) IsLeaf() bool {
 }
 
 //use []Uint256 to create a new MerkleTree
-func NewMerkleTree(hashes []Uint256) (*MerkleTree, error) {
+func NewMerkleTree(hashes []common.Uint256) (*MerkleTree, error) {
 	if len(hashes) == 0 {
 		return nil, errors.New("NewMerkleTree input no item error.")
 	}
@@ -57,7 +58,7 @@ func NewMerkleTree(hashes []Uint256) (*MerkleTree, error) {
 }
 
 //Generate the leaves nodes
-func generateLeaves(hashes []Uint256) []*MerkleTreeNode {
+func generateLeaves(hashes []common.Uint256) []*MerkleTreeNode {
 	var leaves []*MerkleTreeNode
 	for _, d := range hashes {
 		node := &MerkleTreeNode{
@@ -72,7 +73,7 @@ func generateLeaves(hashes []Uint256) []*MerkleTreeNode {
 func levelUp(nodes []*MerkleTreeNode) []*MerkleTreeNode {
 	var nextLevel []*MerkleTreeNode
 	for i := 0; i < len(nodes)/2; i++ {
-		var data []Uint256
+		var data []common.Uint256
 		data = append(data, nodes[i*2].Hash)
 		data = append(data, nodes[i*2+1].Hash)
 		hash := DOUBLE_SHA256(data)
@@ -84,7 +85,7 @@ func levelUp(nodes []*MerkleTreeNode) []*MerkleTreeNode {
 		nextLevel = append(nextLevel, node)
 	}
 	if len(nodes)%2 == 1 {
-		var data []Uint256
+		var data []common.Uint256
 		data = append(data, nodes[len(nodes)-1].Hash)
 		data = append(data, nodes[len(nodes)-1].Hash)
 		hash := DOUBLE_SHA256(data)
@@ -99,13 +100,41 @@ func levelUp(nodes []*MerkleTreeNode) []*MerkleTreeNode {
 }
 
 //input a []uint256, create a MerkleTree & calc the root hash
-func ComputeRoot(hashes []Uint256) (Uint256, error) {
+func ComputeRoot(hashes []common.Uint256) (common.Uint256, error) {
 	if len(hashes) == 0 {
-		return Uint256{}, errors.New("NewMerkleTree input no item error.")
+		return common.Uint256{}, errors.New("NewMerkleTree input no item error.")
 	}
 	if len(hashes) == 1 {
 		return hashes[0], nil
 	}
 	tree, _ := NewMerkleTree(hashes)
 	return tree.Root.Hash, nil
+}
+
+func VerifyRoot(txnsHash []common.Uint256, txnsRoot []byte) error {
+	if hasDuplicateHash(txnsHash) {
+		return fmt.Errorf("transactions contain duplicate hash")
+	}
+
+	computedRoot, err := ComputeRoot(txnsHash)
+	if err != nil {
+		return err
+	}
+
+	if !bytes.Equal(computedRoot.ToArray(), txnsRoot) {
+		return fmt.Errorf("computed txn root %x is different from txn root in header %x", computedRoot.ToArray(), txnsRoot)
+	}
+
+	return nil
+}
+
+func hasDuplicateHash(txnsHash []common.Uint256) bool {
+	count := make(map[common.Uint256]int, len(txnsHash))
+	for _, txnHash := range txnsHash {
+		if count[txnHash] > 0 {
+			return true
+		}
+		count[txnHash]++
+	}
+	return false
 }

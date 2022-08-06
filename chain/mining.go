@@ -3,21 +3,23 @@ package chain
 import (
 	"context"
 
-	"github.com/nknorg/nkn/block"
-	"github.com/nknorg/nkn/common"
-	"github.com/nknorg/nkn/crypto"
-	"github.com/nknorg/nkn/crypto/util"
-	"github.com/nknorg/nkn/pb"
-	"github.com/nknorg/nkn/por"
-	"github.com/nknorg/nkn/signature"
-	"github.com/nknorg/nkn/transaction"
-	"github.com/nknorg/nkn/util/config"
-	"github.com/nknorg/nkn/util/log"
-	"github.com/nknorg/nkn/vault"
+	"github.com/nknorg/nkn/v2/block"
+	"github.com/nknorg/nkn/v2/chain/txvalidator"
+	"github.com/nknorg/nkn/v2/common"
+	"github.com/nknorg/nkn/v2/config"
+	"github.com/nknorg/nkn/v2/crypto"
+	"github.com/nknorg/nkn/v2/pb"
+	"github.com/nknorg/nkn/v2/por"
+	"github.com/nknorg/nkn/v2/signature"
+	"github.com/nknorg/nkn/v2/transaction"
+	"github.com/nknorg/nkn/v2/util"
+	"github.com/nknorg/nkn/v2/util/log"
+	"github.com/nknorg/nkn/v2/vault"
 )
 
 type Mining interface {
-	BuildBlock(ctx context.Context, height uint32, chordID []byte, winnerHash common.Uint256, winnerType pb.WinnerType, timestamp int64) (*block.Block, error)
+	BuildBlock(ctx context.Context, height uint32, chordID []byte, winnerHash common.Uint256, winnerType pb.WinnerType) (*block.Block, error)
+	SignBlock(b *block.Block, timestamp int64) error
 }
 
 type BuiltinMining struct {
@@ -32,7 +34,27 @@ func NewBuiltinMining(account *vault.Account, txnCollector *TxnCollector) *Built
 	}
 }
 
-func (bm *BuiltinMining) BuildBlock(ctx context.Context, height uint32, chordID []byte, winnerHash common.Uint256, winnerType pb.WinnerType, timestamp int64) (*block.Block, error) {
+func isBlockFull(txnCount uint32, txnSize uint32) bool {
+	if config.Parameters.NumTxnPerBlock > 0 && txnCount > config.Parameters.NumTxnPerBlock {
+		return true
+	}
+	if config.MaxBlockSize > 0 && txnSize > config.MaxBlockSize {
+		return true
+	}
+	return false
+}
+
+func isLowFeeTxnFull(txnCount uint32, txnSize uint32) bool {
+	if config.Parameters.NumLowFeeTxnPerBlock > 0 && txnCount > config.Parameters.NumLowFeeTxnPerBlock {
+		return true
+	}
+	if config.Parameters.LowFeeTxnSizePerBlock > 0 && txnSize > config.Parameters.LowFeeTxnSizePerBlock {
+		return true
+	}
+	return false
+}
+
+func (bm *BuiltinMining) BuildBlock(ctx context.Context, height uint32, chordID []byte, winnerHash common.Uint256, winnerType pb.WinnerType) (*block.Block, error) {
 	var txnList []*transaction.Transaction
 	var txnHashList []common.Uint256
 
@@ -43,10 +65,11 @@ func (bm *BuiltinMining) BuildBlock(ctx context.Context, height uint32, chordID 
 	coinbase := bm.CreateCoinbaseTransaction(GetRewardByHeight(height) + donationAmount)
 	txnList = append(txnList, coinbase)
 	txnHashList = append(txnHashList, coinbase.Hash())
-	totalTxsSize := coinbase.GetSize()
-	txCount := 1
+	totalTxSize := coinbase.GetSize()
+	totalTxCount := uint32(1)
+	var lowFeeTxCount, lowFeeTxSize uint32
 
-	if winnerType == pb.TXN_SIGNER {
+	if winnerType == pb.WinnerType_TXN_SIGNER {
 		if _, err = DefaultLedger.Store.GetTransaction(winnerHash); err != nil {
 			var miningSigChainTxn *transaction.Transaction
 			miningSigChainTxn, err = por.GetPorServer().GetSigChainTxn(winnerHash)
@@ -55,8 +78,8 @@ func (bm *BuiltinMining) BuildBlock(ctx context.Context, height uint32, chordID 
 			}
 			txnList = append(txnList, miningSigChainTxn)
 			txnHashList = append(txnHashList, miningSigChainTxn.Hash())
-			totalTxsSize = totalTxsSize + miningSigChainTxn.GetSize()
-			txCount++
+			totalTxSize += miningSigChainTxn.GetSize()
+			totalTxCount++
 		}
 	}
 
@@ -65,10 +88,12 @@ func (bm *BuiltinMining) BuildBlock(ctx context.Context, height uint32, chordID 
 		return nil, err
 	}
 
+	bvs := NewBlockValidationState()
+
 	for {
 		select {
 		case <-ctx.Done():
-			break
+			return nil, ctx.Err()
 		default:
 		}
 
@@ -77,35 +102,50 @@ func (bm *BuiltinMining) BuildBlock(ctx context.Context, height uint32, chordID 
 			break
 		}
 
-		if txn.UnsignedTx.Fee < int64(config.Parameters.MinTxnFee) {
-			log.Warning("transaction fee is too low")
+		if isBlockFull(totalTxCount+1, totalTxSize+txn.GetSize()) {
+			break
+		}
+
+		if transaction.DefaultIsLowFeeTxn(txn) && isLowFeeTxnFull(lowFeeTxCount+1, lowFeeTxSize+txn.GetSize()) {
+			log.Info("Low fee transaction full in block")
+			break
+		}
+
+		if err := txvalidator.VerifyTransaction(txn, height); err != nil {
+			log.Warningf("invalid transaction: %v", err)
 			txnCollection.Pop()
 			continue
 		}
-
-		totalTxsSize = totalTxsSize + txn.GetSize()
-		if totalTxsSize > config.MaxBlockSize {
-			break
+		if err := VerifyTransactionWithLedger(txn, height); err != nil {
+			log.Warningf("invalid transaction: %v", err)
+			txnCollection.Pop()
+			continue
 		}
-
-		txCount++
-		if txCount > int(config.Parameters.NumTxnPerBlock) {
-			break
-		}
-
-		txnHash := txn.Hash()
-		if DefaultLedger.Store.IsTxHashDuplicate(txnHash) {
-			log.Warning("it's a duplicate transaction")
+		if err := bvs.VerifyTransactionWithBlock(txn, height); err != nil {
+			log.Warningf("invalid transaction: %v", err)
+			bvs.Reset()
 			txnCollection.Pop()
 			continue
 		}
 
 		txnList = append(txnList, txn)
-		txnHashList = append(txnHashList, txnHash)
+		txnHashList = append(txnHashList, txn.Hash())
 		if err = txnCollection.Update(); err != nil {
+			bvs.Reset()
 			txnCollection.Pop()
+			continue
+		}
+
+		bvs.Commit()
+		totalTxCount++
+		totalTxSize += txn.GetSize()
+		if transaction.DefaultIsLowFeeTxn(txn) {
+			lowFeeTxCount++
+			lowFeeTxSize += txn.GetSize()
 		}
 	}
+
+	bvs.Close()
 
 	txnRoot, err := crypto.ComputeRoot(txnHashList)
 	if err != nil {
@@ -130,13 +170,12 @@ func (bm *BuiltinMining) BuildBlock(ctx context.Context, height uint32, chordID 
 			UnsignedHeader: &pb.UnsignedHeader{
 				Version:          config.HeaderVersion,
 				PrevBlockHash:    curBlockHash.ToArray(),
-				Timestamp:        timestamp,
 				Height:           height,
 				RandomBeacon:     randomBeacon,
 				TransactionsRoot: txnRoot.ToArray(),
 				WinnerHash:       winnerHash.ToArray(),
 				WinnerType:       winnerType,
-				SignerPk:         bm.account.PublicKey.EncodePoint(),
+				SignerPk:         bm.account.PublicKey,
 				SignerId:         chordID,
 			},
 			Signature: nil,
@@ -148,21 +187,26 @@ func (bm *BuiltinMining) BuildBlock(ctx context.Context, height uint32, chordID 
 		Transactions: txnList,
 	}
 
-	curStateHash, err := DefaultLedger.Store.GenerateStateRoot(block, true, false)
+	curStateHash, err := DefaultLedger.Store.GenerateStateRoot(ctx, block, true, false)
 	if err != nil {
 		return nil, err
 	}
 
 	header.UnsignedHeader.StateRoot = curStateHash.ToArray()
 
-	hash := signature.GetHashForSigning(header)
+	return block, nil
+}
+
+func (bm *BuiltinMining) SignBlock(b *block.Block, timestamp int64) error {
+	b.Header.UnsignedHeader.Timestamp = timestamp
+
+	hash := signature.GetHashForSigning(b.Header)
 	sig, err := crypto.Sign(bm.account.PrivateKey, hash)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	header.Signature = append(header.Signature, sig...)
-
-	return block, nil
+	b.Header.Signature = append(b.Header.Signature, sig...)
+	return nil
 }
 
 func (bm *BuiltinMining) CreateCoinbaseTransaction(reward common.Fixed64) *transaction.Transaction {
@@ -179,7 +223,7 @@ func (bm *BuiltinMining) CreateCoinbaseTransaction(reward common.Fixed64) *trans
 
 	donationProgramhash, _ := common.ToScriptHash(config.DonationAddress)
 	payload := transaction.NewCoinbase(donationProgramhash, redeemHash, reward)
-	pl, err := transaction.Pack(pb.COINBASE_TYPE, payload)
+	pl, err := transaction.Pack(pb.PayloadType_COINBASE_TYPE, payload)
 	if err != nil {
 		return nil
 	}

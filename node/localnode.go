@@ -11,81 +11,73 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/nknorg/nkn/chain"
-	"github.com/nknorg/nkn/chain/pool"
-	"github.com/nknorg/nkn/crypto"
-	"github.com/nknorg/nkn/event"
-	"github.com/nknorg/nkn/pb"
-	"github.com/nknorg/nkn/util/address"
-	"github.com/nknorg/nkn/util/config"
-	"github.com/nknorg/nkn/util/log"
-	"github.com/nknorg/nkn/vault"
+	"github.com/golang/protobuf/proto"
+	"github.com/nknorg/nkn/v2/api/ratelimiter"
+	"github.com/nknorg/nkn/v2/chain"
+	"github.com/nknorg/nkn/v2/chain/pool"
+	"github.com/nknorg/nkn/v2/config"
+	"github.com/nknorg/nkn/v2/event"
+	"github.com/nknorg/nkn/v2/pb"
+	"github.com/nknorg/nkn/v2/util/log"
+	"github.com/nknorg/nkn/v2/vault"
 	"github.com/nknorg/nnet"
 	nnetnode "github.com/nknorg/nnet/node"
 	"github.com/nknorg/nnet/overlay/chord"
 	"github.com/nknorg/nnet/overlay/routing"
 	nnetpb "github.com/nknorg/nnet/protobuf"
+	"golang.org/x/time/rate"
 )
 
 type LocalNode struct {
 	*Node
+	*neighborNodes // neighbor nodes
+	*pool.TxnPool  // transaction pool of local node
+	*hashCache     // txn hash cache
+	*messageHandlerStore
 	account            *vault.Account // local node wallet account
 	nnet               *nnet.NNet     // nnet instance
 	relayer            *RelayService  // relay service
 	quit               chan bool      // block syncing channel
 	requestSigChainTxn *requestTxn
 	receiveTxnMsg      *receiveTxnMsg
-	nbrNodes           // neighbor nodes
-	*pool.TxnPool      // transaction pool of local node
-	*hashCache         // txn hash cache
-	*messageHandlerStore
+	syncHeaderLimiter  *rate.Limiter
+	syncBlockLimiter   *rate.Limiter
 
-	sync.RWMutex
+	mu                sync.RWMutex
 	syncOnce          *sync.Once
-	relayMessageCount uint64    // count how many messages node has relayed since start
-	startTime         time.Time // Time of localNode init
-	proposalSubmitted uint32    // Count of localNode submitted proposal
+	relayMessageCount uint64 // count how many messages node has relayed since start
+	proposalSubmitted uint32 // Count of localNode submitted proposal
 }
 
-func (localNode *LocalNode) MarshalJSON() ([]byte, error) {
-	var out map[string]interface{}
-
-	buf, err := json.Marshal(localNode.Node)
-	if err != nil {
-		return nil, err
-	}
-
-	err = json.Unmarshal(buf, &out)
-	if err != nil {
-		return nil, err
-	}
-
-	out["height"] = localNode.GetHeight()
-	out["uptime"] = time.Since(localNode.startTime).Truncate(time.Second).Seconds()
-	out["version"] = config.Version
-	out["relayMessageCount"] = localNode.GetRelayMessageCount()
-	if config.Parameters.MiningDebug {
-		out["proposalSubmitted"] = localNode.GetProposalSubmitted()
-		out["currTimeStamp"] = time.Now().Unix()
-	}
-
-	return json.Marshal(out)
-}
-
-func NewLocalNode(wallet vault.Wallet, nn *nnet.NNet) (*LocalNode, error) {
+func NewLocalNode(wallet *vault.Wallet, nn *nnet.NNet) (*LocalNode, error) {
 	account, err := wallet.GetDefaultAccount()
 	if err != nil {
 		return nil, err
 	}
 
-	publicKey := account.PublicKey.EncodePoint()
+	addr, err := url.Parse(nn.GetLocalNode().Node.Addr)
+	if err != nil {
+		return nil, err
+	}
+
+	httpsDomain, err := GetDefaultDomainFromIP(addr.Hostname(), config.Parameters.HttpsJsonDomain)
+	if err != nil {
+		return nil, err
+	}
+	wssDomain, err := GetDefaultDomainFromIP(addr.Hostname(), config.Parameters.HttpWssDomain)
+	if err != nil {
+		return nil, err
+	}
 
 	nodeData := &pb.NodeData{
-		PublicKey:       publicKey,
-		WebsocketPort:   uint32(config.Parameters.HttpWsPort),
-		JsonRpcPort:     uint32(config.Parameters.HttpJsonPort),
-		ProtocolVersion: uint32(config.ProtocolVersion),
+		PublicKey:          account.PublicKey,
+		WebsocketPort:      uint32(config.Parameters.HttpWsPort),
+		JsonRpcPort:        uint32(config.Parameters.HttpJsonPort),
+		ProtocolVersion:    uint32(config.ProtocolVersion),
+		TlsWebsocketDomain: wssDomain,
+		TlsWebsocketPort:   uint32(config.Parameters.HttpWssPort),
+		TlsJsonRpcDomain:   httpsDomain,
+		TlsJsonRpcPort:     uint32(config.Parameters.HttpsJsonPort),
 	}
 
 	node, err := NewNode(nn.GetLocalNode().Node.Node, nodeData)
@@ -95,15 +87,17 @@ func NewLocalNode(wallet vault.Wallet, nn *nnet.NNet) (*LocalNode, error) {
 
 	localNode := &LocalNode{
 		Node:                node,
+		neighborNodes:       newNeighborNodes(),
 		account:             account,
 		TxnPool:             pool.NewTxPool(),
 		quit:                make(chan bool, 1),
 		hashCache:           newHashCache(),
 		requestSigChainTxn:  newRequestTxn(requestSigChainTxnWorkerPoolSize, nil),
 		receiveTxnMsg:       newReceiveTxnMsg(receiveTxnMsgWorkerPoolSize, nil),
+		syncHeaderLimiter:   rate.NewLimiter(rate.Limit(config.Parameters.SyncBlockHeaderRateLimit), int(config.Parameters.SyncBlockHeaderRateBurst)),
+		syncBlockLimiter:    rate.NewLimiter(rate.Limit(config.Parameters.SyncBlockRateLimit), int(config.Parameters.SyncBlockRateBurst)),
 		messageHandlerStore: newMessageHandlerStore(),
 		nnet:                nn,
-		startTime:           time.Now(),
 	}
 
 	localNode.relayer = NewRelayService(wallet, localNode)
@@ -116,6 +110,19 @@ func NewLocalNode(wallet vault.Wallet, nn *nnet.NNet) (*LocalNode, error) {
 	log.Infof("Init node ID to %v", localNode.GetID())
 
 	event.Queue.Subscribe(event.BlockPersistCompleted, localNode.cleanupTransactions)
+	event.Queue.Subscribe(event.NewBlockProduced, localNode.CheckIDChange)
+
+	nn.MustApplyMiddleware(nnetnode.ConnectionAccepted{func(conn net.Conn) (bool, bool) {
+		host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+		if err == nil {
+			limiter := ratelimiter.GetLimiter("node:"+host, config.Parameters.NodeIPRateLimit, int(config.Parameters.NodeIPRateBurst))
+			if !limiter.Allow() {
+				log.Infof("Node connection limit of %s reached", host)
+				return false, false
+			}
+		}
+		return true, true
+	}, 0})
 
 	nn.MustApplyMiddleware(nnetnode.WillConnectToNode{func(n *nnetpb.Node) (bool, bool) {
 		err := localNode.shouldConnectToNode(n)
@@ -135,7 +142,9 @@ func NewLocalNode(wallet vault.Wallet, nn *nnet.NNet) (*LocalNode, error) {
 		return true
 	}, 1000})
 
+	var startOnce sync.Once
 	nn.MustApplyMiddleware(chord.NeighborAdded{func(remoteNode *nnetnode.RemoteNode, index int) bool {
+		startOnce.Do(localNode.startConnectingToRandomNeighbors)
 		err := localNode.maybeAddRemoteNode(remoteNode)
 		if err != nil {
 			remoteNode.Stop(err)
@@ -145,9 +154,9 @@ func NewLocalNode(wallet vault.Wallet, nn *nnet.NNet) (*LocalNode, error) {
 	}, 0})
 
 	nn.MustApplyMiddleware(chord.NeighborRemoved{func(remoteNode *nnetnode.RemoteNode) bool {
-		nbr := localNode.getNbrByNNetNode(remoteNode)
+		nbr := localNode.getNeighborByNNetNode(remoteNode)
 		if nbr != nil {
-			localNode.DelNbrNode(nbr.GetID())
+			localNode.removeNeighborNode(nbr.GetID())
 		}
 		return true
 	}, 0})
@@ -159,7 +168,7 @@ func NewLocalNode(wallet vault.Wallet, nn *nnet.NNet) (*LocalNode, error) {
 	nn.MustApplyMiddleware(nnetnode.MessageWillDecode{func(rn *nnetnode.RemoteNode, msg []byte) ([]byte, bool) {
 		decrypted, err := localNode.decryptMessage(msg, rn)
 		if err != nil {
-			if localNode.getNbrByNNetNode(rn) != nil {
+			if localNode.getNeighborByNNetNode(rn) != nil {
 				rn.Stop(err)
 			} else {
 				log.Warningf("Decrypt message from %v error: %v", rn, err)
@@ -171,100 +180,48 @@ func NewLocalNode(wallet vault.Wallet, nn *nnet.NNet) (*LocalNode, error) {
 
 	nn.MustApplyMiddleware(routing.RemoteMessageRouted{localNode.remoteMessageRouted, 0})
 
+	nn.MustApplyMiddleware(chord.RelayPriority{func(rn *nnetnode.RemoteNode, priority float64) (float64, bool) {
+		var connTime time.Duration
+		nbr := localNode.getNeighborByNNetNode(rn)
+		if nbr != nil {
+			connTime = time.Since(nbr.Node.startTime)
+		}
+		priority = relayPriority(priority, connTime)
+		return priority, true
+	}, 0})
+
 	return localNode, nil
+}
+
+func (localNode *LocalNode) MarshalJSON() ([]byte, error) {
+	var out map[string]interface{}
+
+	buf, err := json.Marshal(localNode.Node)
+	if err != nil {
+		return nil, err
+	}
+
+	err = json.Unmarshal(buf, &out)
+	if err != nil {
+		return nil, err
+	}
+
+	out["height"] = localNode.GetHeight()
+	out["uptime"] = time.Since(localNode.Node.startTime) / time.Second
+	out["version"] = config.Version
+	out["relayMessageCount"] = localNode.GetRelayMessageCount()
+	if config.Parameters.MiningDebug {
+		out["proposalSubmitted"] = localNode.GetProposalSubmitted()
+		out["currTimeStamp"] = time.Now().Unix()
+	}
+
+	return json.Marshal(out)
 }
 
 func (localNode *LocalNode) Start() error {
 	localNode.startRelayer()
 	localNode.initSyncing()
 	localNode.initTxnHandlers()
-	return nil
-}
-
-func (localNode *LocalNode) shouldConnectToNode(n *nnetpb.Node) error {
-	if n.GetData() != nil {
-		nodeData := &pb.NodeData{}
-		err := proto.Unmarshal(n.Data, nodeData)
-		if err != nil {
-			return err
-		}
-
-		if nodeData.ProtocolVersion < config.MinCompatibleProtocolVersion || nodeData.ProtocolVersion > config.MaxCompatibleProtocolVersion {
-			return fmt.Errorf("remote node has protocol version %d, which is not compatible with local node protocol verison %d", nodeData.ProtocolVersion, config.ProtocolVersion)
-		}
-
-		id, err := chain.DefaultLedger.Store.GetID(nodeData.PublicKey)
-		if err != nil || len(id) == 0 || bytes.Equal(id, crypto.Sha256ZeroHash) {
-			if localNode.GetSyncState() == pb.PERSIST_FINISHED {
-				return fmt.Errorf("Remote node id can not be found in local ledger: err-%v, id-%v", err, id)
-			}
-		} else {
-			if !bytes.Equal(id, n.GetId()) {
-				return fmt.Errorf("Remote node id should be %x instead of %x", id, n.GetId())
-			}
-		}
-	}
-
-	if address.ShouldRejectAddr(localNode.GetAddr(), n.GetAddr()) {
-		return errors.New("Remote port is different from local port")
-	}
-
-	return nil
-}
-
-func (localNode *LocalNode) verifyRemoteNode(remoteNode *nnetnode.RemoteNode) error {
-	if remoteNode.GetId() == nil {
-		return errors.New("Remote node id is nil")
-	}
-
-	if remoteNode.GetData() == nil {
-		return errors.New("Remote node data is nil")
-	}
-
-	err := localNode.shouldConnectToNode(remoteNode.Node.Node)
-	if err != nil {
-		return err
-	}
-
-	addr, err := url.Parse(remoteNode.GetAddr())
-	if err != nil {
-		return err
-	}
-
-	connHost, connPort, err := net.SplitHostPort(remoteNode.GetConn().RemoteAddr().String())
-	if err != nil {
-		return err
-	}
-
-	if !address.IsPrivateIP(net.ParseIP(connHost)) && addr.Hostname() != connHost {
-		return fmt.Errorf("Remote node host %s is different from its connection host %s", addr.Hostname(), connHost)
-	}
-
-	if remoteNode.IsOutbound && addr.Port() != connPort {
-		return fmt.Errorf("Remote node port %v is different from its connection port %v", addr.Port(), connPort)
-	}
-
-	return nil
-}
-
-func (localNode *LocalNode) addRemoteNode(nnetNode *nnetnode.RemoteNode) error {
-	remoteNode, err := NewRemoteNode(localNode, nnetNode)
-	if err != nil {
-		return err
-	}
-
-	err = localNode.AddNbrNode(remoteNode)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (localNode *LocalNode) maybeAddRemoteNode(remoteNode *nnetnode.RemoteNode) error {
-	if remoteNode != nil && localNode.getNbrByNNetNode(remoteNode) == nil {
-		return localNode.addRemoteNode(remoteNode)
-	}
 	return nil
 }
 
@@ -277,15 +234,15 @@ func (localNode *LocalNode) IncrementProposalSubmitted() {
 }
 
 func (localNode *LocalNode) GetRelayMessageCount() uint64 {
-	localNode.RLock()
-	defer localNode.RUnlock()
+	localNode.mu.RLock()
+	defer localNode.mu.RUnlock()
 	return localNode.relayMessageCount
 }
 
 func (localNode *LocalNode) IncrementRelayMessageCount() {
-	localNode.Lock()
+	localNode.mu.Lock()
 	localNode.relayMessageCount++
-	localNode.Unlock()
+	localNode.mu.Unlock()
 }
 
 func (localNode *LocalNode) GetTxnPool() *pool.TxnPool {
@@ -299,19 +256,11 @@ func (localNode *LocalNode) GetHeight() uint32 {
 func (localNode *LocalNode) SetSyncState(s pb.SyncState) bool {
 	log.Infof("Set sync state to %s", s.String())
 	changed := localNode.Node.SetSyncState(s)
-	if changed && s == pb.PERSIST_FINISHED {
+	if changed && s == pb.SyncState_PERSIST_FINISHED {
+		config.SyncPruning = config.LivePruning
 		localNode.verifyNeighbors()
 	}
 	return changed
-}
-
-func (localNode *LocalNode) verifyNeighbors() {
-	for _, nbr := range localNode.GetNeighbors(nil) {
-		err := localNode.verifyRemoteNode(nbr.nnetNode)
-		if err != nil {
-			nbr.nnetNode.Stop(err)
-		}
-	}
 }
 
 func (localNode *LocalNode) GetSyncState() pb.SyncState {
@@ -325,6 +274,10 @@ func (localNode *LocalNode) SetMinVerifiableHeight(height uint32) {
 
 func (localNode *LocalNode) GetWsAddr() string {
 	return fmt.Sprintf("%s:%d", localNode.GetHostname(), localNode.GetWebsocketPort())
+}
+
+func (localNode *LocalNode) GetWssAddr() string {
+	return fmt.Sprintf("%s:%d", localNode.GetTlsWebsocketDomain(), localNode.GetTlsWebsocketPort())
 }
 
 func (localNode *LocalNode) FindSuccessorAddrs(key []byte, numSucc int) ([]string, error) {
@@ -350,43 +303,74 @@ func (localNode *LocalNode) FindSuccessorAddrs(key []byte, numSucc int) ([]strin
 	return addrs, nil
 }
 
-func (localNode *LocalNode) findAddr(key []byte) (string, []byte, []byte, error) {
+func (localNode *LocalNode) findAddrForClient(key []byte, tls bool) (string, string, []byte, []byte, error) {
 	c, ok := localNode.nnet.Network.(*chord.Chord)
 	if !ok {
-		return "", nil, nil, errors.New("Overlay is not chord")
+		return "", "", nil, nil, errors.New("Overlay is not chord")
 	}
 
 	preds, err := c.FindPredecessors(key, 1)
 	if err != nil {
-		return "", nil, nil, err
+		return "", "", nil, nil, err
 	}
-
 	if len(preds) == 0 {
-		return "", nil, nil, errors.New("Found no predecessors")
+		return "", "", nil, nil, errors.New("Found no predecessors")
 	}
 
 	pred := preds[0]
 	nodeData := &pb.NodeData{}
 	err = proto.Unmarshal(pred.Data, nodeData)
 	if err != nil {
-		return "", nil, nil, err
+		return "", "", nil, nil, err
 	}
 
-	address, _ := url.Parse(pred.Addr)
-	if err != nil {
-		return "", nil, nil, err
+	var wsHost, rpcHost string
+	var wsPort, rpcPort uint16
+
+	if tls == true {
+		// We only check wss because https rpc is optional
+		if len(nodeData.TlsWebsocketDomain) == 0 || nodeData.TlsWebsocketPort == 0 {
+			return "", "", nil, nil, errors.New("Predecessor node doesn't support WSS protocol")
+		}
+		wsHost = nodeData.TlsWebsocketDomain
+		wsPort = uint16(nodeData.TlsWebsocketPort)
+		rpcHost = nodeData.TlsJsonRpcDomain
+		rpcPort = uint16(nodeData.TlsJsonRpcPort)
+	} else {
+		address, err := url.Parse(pred.Addr)
+		if err != nil {
+			return "", "", nil, nil, err
+		}
+		wsHost = address.Hostname()
+		if wsHost == "" {
+			return "", "", nil, nil, errors.New("Hostname is empty")
+		}
+		wsPort = uint16(nodeData.WebsocketPort)
+		rpcHost = wsHost
+		rpcPort = uint16(nodeData.JsonRpcPort)
 	}
 
-	host := address.Hostname()
-	if host == "" {
-		return "", nil, nil, errors.New("Hostname is empty")
-	}
+	wsAddr := fmt.Sprintf("%s:%d", wsHost, wsPort)
+	rpcAddr := fmt.Sprintf("%s:%d", rpcHost, rpcPort)
 
-	wsAddr := fmt.Sprintf("%s:%d", host, nodeData.WebsocketPort)
-
-	return wsAddr, nodeData.PublicKey, pred.Id, nil
+	return wsAddr, rpcAddr, nodeData.PublicKey, pred.Id, nil
 }
 
-func (localNode *LocalNode) FindWsAddr(key []byte) (string, []byte, []byte, error) {
-	return localNode.findAddr(key)
+func (localNode *LocalNode) FindWsAddr(key []byte) (string, string, []byte, []byte, error) {
+	return localNode.findAddrForClient(key, false)
+}
+
+func (localNode *LocalNode) FindWssAddr(key []byte) (string, string, []byte, []byte, error) {
+	return localNode.findAddrForClient(key, true)
+}
+
+func (localNode *LocalNode) CheckIDChange(v interface{}) {
+	localHeight := chain.DefaultLedger.Store.GetHeight()
+	id, err := chain.DefaultLedger.Store.GetID(localNode.PublicKey, localHeight)
+	if err != nil {
+		log.Fatalf("local node has no id:%v", err)
+	}
+	if !bytes.Equal(localNode.Id, id) {
+		log.Fatalf("local node id has changed")
+	}
 }

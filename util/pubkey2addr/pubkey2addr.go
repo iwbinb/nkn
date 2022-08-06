@@ -5,19 +5,14 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/nknorg/nkn/common"
-	"github.com/nknorg/nkn/crypto"
-	"github.com/nknorg/nkn/program"
+	"github.com/nknorg/nkn/v2/crypto"
+	"github.com/nknorg/nkn/v2/program"
 )
 
 func Key2Address(key string) (addr string, err error) {
-	var k []byte
-	var pk *crypto.PubKey
-	var redeemHash common.Uint160
-
-	if k, err = hex.DecodeString(key); err == nil {
-		if pk, err = crypto.DecodePoint(k); err == nil {
-			if redeemHash, err = program.CreateRedeemHash(pk); err == nil {
+	if pk, err := hex.DecodeString(key); err == nil {
+		if err = crypto.CheckPublicKey(pk); err == nil {
+			if redeemHash, err := program.CreateProgramHash(pk); err == nil {
 				return redeemHash.ToAddress()
 			}
 		}

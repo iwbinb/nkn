@@ -1,73 +1,89 @@
 package server
 
 import (
+	"bytes"
+	"compress/zlib"
 	"context"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/nknorg/nkn/api/common"
-	"github.com/nknorg/nkn/api/websocket/messagebuffer"
-	"github.com/nknorg/nkn/api/websocket/session"
-	"github.com/nknorg/nkn/chain"
-	. "github.com/nknorg/nkn/common"
-	"github.com/nknorg/nkn/crypto"
-	"github.com/nknorg/nkn/event"
-	"github.com/nknorg/nkn/node"
-	"github.com/nknorg/nkn/pb"
-	"github.com/nknorg/nkn/util/address"
-	"github.com/nknorg/nkn/util/config"
-	"github.com/nknorg/nkn/util/log"
-	"github.com/nknorg/nkn/vault"
+	"github.com/golang/protobuf/proto"
+	api "github.com/nknorg/nkn/v2/api/common"
+	"github.com/nknorg/nkn/v2/api/common/errcode"
+	"github.com/nknorg/nkn/v2/api/ratelimiter"
+	"github.com/nknorg/nkn/v2/api/websocket/messagebuffer"
+	"github.com/nknorg/nkn/v2/api/websocket/session"
+	"github.com/nknorg/nkn/v2/chain"
+	"github.com/nknorg/nkn/v2/common"
+	"github.com/nknorg/nkn/v2/config"
+	"github.com/nknorg/nkn/v2/crypto"
+	"github.com/nknorg/nkn/v2/event"
+	"github.com/nknorg/nkn/v2/node"
+	"github.com/nknorg/nkn/v2/pb"
+	"github.com/nknorg/nkn/v2/util/address"
+	"github.com/nknorg/nkn/v2/util/log"
+	"github.com/nknorg/nkn/v2/vault"
 
 	"github.com/gorilla/websocket"
 )
 
 const (
-	TlsPort                      uint16 = 443
-	sigChainCacheExpiration             = config.ConsensusTimeout
-	sigChainCacheCleanupInterval        = time.Second
+	TlsPort                      = 443
+	sigChainCacheExpiration      = config.ConsensusTimeout
+	sigChainCacheCleanupInterval = time.Second
+	pingInterval                 = 8 * time.Second
+	pongTimeout                  = 10 * time.Second // should be greater than pingInterval
+	maxMessageSize               = config.MaxClientMessageSize
+	messageDeliveredCacheSize    = 65536
+	checkWrongClientsInterval    = time.Minute
 )
 
 type Handler struct {
-	handler  common.Handler
+	handler  api.Handler
 	pushFlag bool
 }
 
 type WsServer struct {
 	sync.RWMutex
-	Upgrader      websocket.Upgrader
-	listener      net.Listener
-	server        *http.Server
-	SessionList   *session.SessionList
-	ActionMap     map[string]Handler
-	TxHashMap     map[string]string //key: txHash   value:sessionid
-	localNode     *node.LocalNode
-	wallet        vault.Wallet
-	messageBuffer *messagebuffer.MessageBuffer
-	sigChainCache Cache
+	Upgrader              websocket.Upgrader
+	listener              net.Listener
+	tlsListener           net.Listener
+	server                *http.Server
+	tlsServer             *http.Server
+	SessionList           *session.SessionList
+	ActionMap             map[string]Handler
+	TxHashMap             map[string]string //key: txHash   value:sessionid
+	localNode             *node.LocalNode
+	wallet                *vault.Wallet
+	messageBuffer         *messagebuffer.MessageBuffer
+	messageDeliveredCache *DelayedChan
+	sigChainCache         common.Cache
 }
 
-func InitWsServer(localNode *node.LocalNode, wallet vault.Wallet) *WsServer {
+func InitWsServer(localNode *node.LocalNode, wallet *vault.Wallet) *WsServer {
 	ws := &WsServer{
-		Upgrader:      websocket.Upgrader{},
-		SessionList:   session.NewSessionList(),
-		TxHashMap:     make(map[string]string),
-		localNode:     localNode,
-		wallet:        wallet,
-		messageBuffer: messagebuffer.NewMessageBuffer(),
-		sigChainCache: NewGoCache(sigChainCacheExpiration, sigChainCacheCleanupInterval),
+		Upgrader:              websocket.Upgrader{},
+		SessionList:           session.NewSessionList(),
+		TxHashMap:             make(map[string]string),
+		localNode:             localNode,
+		wallet:                wallet,
+		messageBuffer:         messagebuffer.NewMessageBuffer(),
+		messageDeliveredCache: NewDelayedChan(messageDeliveredCacheSize, pongTimeout),
+		sigChainCache:         common.NewGoCache(sigChainCacheExpiration, sigChainCacheCleanupInterval),
 	}
 	return ws
 }
 
-func (ws *WsServer) Start() error {
+func (ws *WsServer) Start(wssCertReady chan struct{}) error {
 	if config.Parameters.HttpWsPort == 0 {
 		log.Error("Not configure HttpWsPort port ")
 		return nil
@@ -77,98 +93,112 @@ func (ws *WsServer) Start() error {
 		return true
 	}
 
-	tlsFlag := false
-	if tlsFlag || config.Parameters.HttpWsPort%1000 == TlsPort {
-		var err error
-		ws.listener, err = ws.initTlsListen()
-		if err != nil {
-			log.Error("Https Cert: ", err.Error())
-			return err
-		}
-	} else {
-		var err error
-		ws.listener, err = net.Listen("tcp", ":"+strconv.Itoa(int(config.Parameters.HttpWsPort)))
-		if err != nil {
-			log.Error("net.Listen: ", err.Error())
-			return err
-		}
+	var err error
+
+	ws.listener, err = net.Listen("tcp", ":"+strconv.Itoa(int(config.Parameters.HttpWsPort)))
+	if err != nil {
+		log.Error("net.Listen: ", err.Error())
+		return err
 	}
 
 	event.Queue.Subscribe(event.SendInboundMessageToClient, ws.sendInboundRelayMessageToClient)
 
-	var done = make(chan bool)
-	go ws.checkSessionsTimeout(done)
-
 	ws.server = &http.Server{Handler: http.HandlerFunc(ws.websocketHandler)}
-	err := ws.server.Serve(ws.listener)
+	go ws.server.Serve(ws.listener)
 
-	done <- true
-	if err != nil {
-		log.Error("ListenAndServe: ", err.Error())
-		return err
-	}
+	go func(wssCertReady chan struct{}) {
+		for {
+			select {
+			case <-wssCertReady:
+				log.Info("wss cert received")
+				ws.tlsListener, err = ws.initTlsListen()
+				if err != nil {
+					log.Error("Https Cert: ", err.Error())
+				}
+				err = ws.server.Serve(ws.tlsListener)
+				if err != nil {
+					log.Error(err)
+				}
+				return
+			case <-time.After(300 * time.Second):
+				log.Info("wss server is unavailable yet")
+			}
+		}
+	}(wssCertReady)
+
+	go ws.startCheckingLostMessages()
+
+	go ws.startCheckingWrongClients()
+
 	return nil
-
 }
 
 func (ws *WsServer) registryMethod() {
-	gettxhashmap := func(s common.Serverer, cmd map[string]interface{}) map[string]interface{} {
+	gettxhashmap := func(s api.Serverer, cmd map[string]interface{}, ctx context.Context) map[string]interface{} {
 		ws.Lock()
 		defer ws.Unlock()
-		resp := common.RespPacking(len(ws.TxHashMap), common.SUCCESS)
+		resp := api.RespPacking(len(ws.TxHashMap), errcode.SUCCESS)
 		return resp
 	}
 
-	heartbeat := func(s common.Serverer, cmd map[string]interface{}) map[string]interface{} {
-		return common.RespPacking(cmd["Userid"], common.SUCCESS)
+	heartbeat := func(s api.Serverer, cmd map[string]interface{}, ctx context.Context) map[string]interface{} {
+		return api.RespPacking(cmd["Userid"], errcode.SUCCESS)
 
 	}
 
-	getsessioncount := func(s common.Serverer, cmd map[string]interface{}) map[string]interface{} {
-		return common.RespPacking(ws.SessionList.GetSessionCount(), common.SUCCESS)
+	getsessioncount := func(s api.Serverer, cmd map[string]interface{}, ctx context.Context) map[string]interface{} {
+		return api.RespPacking(ws.SessionList.GetSessionCount(), errcode.SUCCESS)
 	}
 
-	setClient := func(s common.Serverer, cmd map[string]interface{}) map[string]interface{} {
+	setClient := func(s api.Serverer, cmd map[string]interface{}, ctx context.Context) map[string]interface{} {
 		addrStr, ok := cmd["Addr"].(string)
 		if !ok {
-			return common.RespPacking(nil, common.INVALID_PARAMS)
+			return api.RespPacking(nil, errcode.INVALID_PARAMS)
 		}
+
 		clientID, pubKey, _, err := address.ParseClientAddress(addrStr)
 		if err != nil {
 			log.Error("Parse client address error:", err)
-			return common.RespPacking(nil, common.INVALID_PARAMS)
+			return api.RespPacking(nil, errcode.INVALID_PARAMS)
 		}
 
-		_, err = crypto.DecodePoint(pubKey)
+		err = crypto.CheckPublicKey(pubKey)
 		if err != nil {
-			log.Error("Invalid public key hex decoding to point:", err)
-			return common.RespPacking(nil, common.INVALID_PARAMS)
+			log.Error("Invalid public key hex:", err)
+			return api.RespPacking(nil, errcode.INVALID_PARAMS)
 		}
 
-		// TODO: use signature (or better, with one-time challange) to verify identity
+		// TODO: use signature (or better, with one-time challenge) to verify identity
 
-		localNode, err := s.GetNetNode()
-		if err != nil {
-			return common.RespPacking(nil, common.INTERNAL_ERROR)
+		localNode := s.GetNetNode()
+
+		isTlsClient := cmd["IsTls"].(bool)
+		var wsAddr, rpcAddr, localAddr string
+		var pubkey, id []byte
+
+		if isTlsClient {
+			wsAddr, rpcAddr, pubkey, id, err = localNode.FindWssAddr(clientID)
+			localAddr = localNode.GetWssAddr()
+		} else {
+			wsAddr, rpcAddr, pubkey, id, err = localNode.FindWsAddr(clientID)
+			localAddr = localNode.GetWsAddr()
 		}
-
-		addr, pubkey, id, err := localNode.FindWsAddr(clientID)
 		if err != nil {
 			log.Errorf("Find websocket address error: %v", err)
-			return common.RespPacking(nil, common.INTERNAL_ERROR)
+			return api.RespPacking(nil, errcode.INTERNAL_ERROR)
 		}
 
-		if addr != localNode.GetWsAddr() {
-			return common.RespPacking(common.NodeInfo(addr, pubkey, id), common.WRONG_NODE)
+		if wsAddr != localAddr {
+			return api.RespPacking(api.NodeInfo(wsAddr, rpcAddr, pubkey, id), errcode.WRONG_NODE)
 		}
 
 		newSessionID := hex.EncodeToString(clientID)
 		session, err := ws.SessionList.ChangeSessionToClient(cmd["Userid"].(string), newSessionID)
 		if err != nil {
 			log.Error("Change session id error: ", err)
-			return common.RespPacking(nil, common.INTERNAL_ERROR)
+			return api.RespPacking(nil, errcode.INTERNAL_ERROR)
 		}
-		session.SetClient(clientID, pubKey, &addrStr)
+		session.SetClient(clientID, pubKey, &addrStr, isTlsClient)
 
 		go func() {
 			messages := ws.messageBuffer.PopMessages(clientID)
@@ -178,8 +208,8 @@ func (ws *WsServer) registryMethod() {
 		}()
 
 		var sigChainBlockHeight uint32
-		if chain.DefaultLedger.Store.GetHeight() >= config.MaxRollbackBlocks {
-			sigChainBlockHeight = chain.DefaultLedger.Store.GetHeight() - config.MaxRollbackBlocks
+		if chain.DefaultLedger.Store.GetHeight() >= config.SigChainBlockDelay {
+			sigChainBlockHeight = chain.DefaultLedger.Store.GetHeight() - config.SigChainBlockDelay
 		}
 		sigChainBlockHash, err := chain.DefaultLedger.Store.GetBlockHash(sigChainBlockHeight)
 		if err != nil {
@@ -187,10 +217,10 @@ func (ws *WsServer) registryMethod() {
 		}
 
 		res := make(map[string]interface{})
-		res["node"] = common.NodeInfo(addr, pubkey, id)
-		res["sigChainBlockHash"] = BytesToHexString(sigChainBlockHash.ToArray())
+		res["node"] = api.NodeInfo(wsAddr, rpcAddr, pubkey, id)
+		res["sigChainBlockHash"] = hex.EncodeToString(sigChainBlockHash.ToArray())
 
-		return common.RespPacking(res, common.SUCCESS)
+		return api.RespPacking(res, errcode.SUCCESS)
 	}
 
 	actionMap := map[string]Handler{
@@ -200,7 +230,7 @@ func (ws *WsServer) registryMethod() {
 		"setClient":       {handler: setClient},
 	}
 
-	for name, handler := range common.InitialAPIHandlers {
+	for name, handler := range api.InitialAPIHandlers {
 		if handler.IsAccessableByWebsocket() {
 			actionMap[name] = Handler{handler: handler.Handler}
 		}
@@ -216,60 +246,63 @@ func (ws *WsServer) Stop() {
 	}
 }
 
-func (ws *WsServer) Restart() {
-	go func() {
-		time.Sleep(time.Second)
-		ws.Stop()
-		time.Sleep(time.Second)
-		go ws.Start()
-	}()
-}
-
-func (ws *WsServer) checkSessionsTimeout(done chan bool) {
-	ticker := time.NewTicker(time.Second * 10)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			var closeList []*session.Session
-			ws.SessionList.ForEachSession(func(s *session.Session) {
-				if s.SessionTimeoverCheck() {
-					resp := common.ResponsePack(common.SESSION_EXPIRED)
-					ws.respondToSession(s, resp)
-					closeList = append(closeList, s)
-				}
-			})
-			for _, s := range closeList {
-				ws.SessionList.CloseSession(s)
-			}
-
-		case <-done:
+//websocketHandler
+func (ws *WsServer) websocketHandler(w http.ResponseWriter, r *http.Request) {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		limiter := ratelimiter.GetLimiter("ws:"+host, config.Parameters.WsIPRateLimit, int(config.Parameters.WsIPRateBurst))
+		if !limiter.Allow() {
+			log.Infof("Ws connection limit of %s reached", host)
+			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
 	}
 
-}
-
-//websocketHandler
-func (ws *WsServer) websocketHandler(w http.ResponseWriter, r *http.Request) {
 	wsConn, err := ws.Upgrader.Upgrade(w, r, nil)
-
 	if err != nil {
 		log.Error("websocket Upgrader: ", err)
 		return
 	}
 	defer wsConn.Close()
-	nsSession, err := ws.SessionList.NewSession(wsConn)
+
+	sess, err := ws.SessionList.NewSession(wsConn)
 	if err != nil {
 		log.Error("websocket NewSession:", err)
 		return
 	}
 
 	defer func() {
-		ws.deleteTxHashs(nsSession.GetSessionId())
-		ws.SessionList.CloseSession(nsSession)
+		ws.deleteTxHashs(sess.GetSessionId())
+		ws.SessionList.CloseSession(sess)
 		if err := recover(); err != nil {
 			log.Error("websocket recover:", err)
+		}
+	}()
+
+	wsConn.SetReadLimit(maxMessageSize)
+	wsConn.SetReadDeadline(time.Now().Add(pongTimeout))
+	wsConn.SetPongHandler(func(string) error {
+		wsConn.SetReadDeadline(time.Now().Add(pongTimeout))
+		sess.UpdateLastReadTime()
+		return nil
+	})
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+		var err error
+		for {
+			select {
+			case <-ticker.C:
+				err = sess.Ping()
+				if err != nil {
+					return
+				}
+			case <-done:
+				return
+			}
 		}
 	}()
 
@@ -280,8 +313,12 @@ func (ws *WsServer) websocketHandler(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		if ws.OnDataHandle(nsSession, messageType, bysMsg, r) {
-			nsSession.UpdateActiveTime()
+		wsConn.SetReadDeadline(time.Now().Add(pongTimeout))
+		sess.UpdateLastReadTime()
+
+		err = ws.OnDataHandle(sess, messageType, bysMsg, r)
+		if err != nil {
+			log.Error(err)
 		}
 	}
 }
@@ -299,68 +336,83 @@ func (ws *WsServer) IsValidMsg(reqMsg map[string]interface{}) bool {
 	return true
 }
 
-func (ws *WsServer) OnDataHandle(curSession *session.Session, messageType int, bysMsg []byte, r *http.Request) bool {
+func (ws *WsServer) OnDataHandle(curSession *session.Session, messageType int, bysMsg []byte, r *http.Request) error {
 	if messageType == websocket.BinaryMessage {
 		msg := &pb.ClientMessage{}
 		err := proto.Unmarshal(bysMsg, msg)
 		if err != nil {
-			log.Error("Parse client message error:", err)
-			return false
+			return fmt.Errorf("Parse client message error: %v", err)
+		}
+
+		var r io.Reader = bytes.NewReader(msg.Message)
+		switch msg.CompressionType {
+		case pb.CompressionType_COMPRESSION_NONE:
+		case pb.CompressionType_COMPRESSION_ZLIB:
+			r, err = zlib.NewReader(r)
+			if err != nil {
+				return fmt.Errorf("Create zlib reader error: %v", err)
+			}
+			defer r.(io.ReadCloser).Close()
+		default:
+			return fmt.Errorf("Unsupported message compression type %v", msg.CompressionType)
+		}
+
+		b, err := ioutil.ReadAll(io.LimitReader(r, config.MaxClientMessageSize+1))
+		if err != nil {
+			return fmt.Errorf("ReadAll from reader error: %v", err)
+		}
+		if len(b) > config.MaxClientMessageSize {
+			return fmt.Errorf("Max client message size reached.")
 		}
 
 		switch msg.MessageType {
-		case pb.OUTBOUND_MESSAGE:
+		case pb.ClientMessageType_OUTBOUND_MESSAGE:
 			outboundMsg := &pb.OutboundMessage{}
-			err = proto.Unmarshal(msg.Message, outboundMsg)
+			err = proto.Unmarshal(b, outboundMsg)
 			if err != nil {
-				log.Errorf("Unmarshal outbound message error: %v", err)
-				return false
+				return fmt.Errorf("Unmarshal outbound message error: %v", err)
 			}
 			ws.sendOutboundRelayMessage(curSession.GetAddrStr(), outboundMsg)
-		case pb.RECEIPT:
+		case pb.ClientMessageType_RECEIPT:
 			receipt := &pb.Receipt{}
-			err = proto.Unmarshal(msg.Message, receipt)
+			err = proto.Unmarshal(b, receipt)
 			if err != nil {
-				log.Errorf("Unmarshal receipt error: %v", err)
-				return false
+				return fmt.Errorf("Unmarshal receipt error: %v", err)
 			}
 			err = ws.handleReceipt(receipt)
 			if err != nil {
-				log.Errorf("Handle receipt error: %v", err)
-				return false
+				return fmt.Errorf("Handle receipt error: %v", err)
 			}
 		default:
-			log.Errorf("unsupported client message type %v", msg.MessageType)
-			return false
+			return fmt.Errorf("unsupported client message type %v", msg.MessageType)
 		}
 
-		return true
+		return nil
 	}
 
 	var req = make(map[string]interface{})
 
 	if err := json.Unmarshal(bysMsg, &req); err != nil {
-		resp := common.ResponsePack(common.ILLEGAL_DATAFORMAT)
+		resp := api.ResponsePack(errcode.ILLEGAL_DATAFORMAT)
 		ws.respondToSession(curSession, resp)
-		log.Error("websocket OnDataHandle:", err)
-		return false
+		return fmt.Errorf("websocket OnDataHandle: %v", err)
 	}
 	actionName, ok := req["Action"].(string)
 	if !ok {
-		resp := common.ResponsePack(common.INVALID_METHOD)
+		resp := api.ResponsePack(errcode.INVALID_METHOD)
 		ws.respondToSession(curSession, resp)
-		return false
+		return nil
 	}
 	action, ok := ws.ActionMap[actionName]
 	if !ok {
-		resp := common.ResponsePack(common.INVALID_METHOD)
+		resp := api.ResponsePack(errcode.INVALID_METHOD)
 		ws.respondToSession(curSession, resp)
-		return false
+		return nil
 	}
 	if !ws.IsValidMsg(req) {
-		resp := common.ResponsePack(common.INVALID_PARAMS)
+		resp := api.ResponsePack(errcode.INVALID_PARAMS)
 		ws.respondToSession(curSession, resp)
-		return true
+		return nil
 	}
 	if height, ok := req["Height"].(float64); ok {
 		req["Height"] = strconv.FormatInt(int64(height), 10)
@@ -369,8 +421,9 @@ func (ws *WsServer) OnDataHandle(curSession *session.Session, messageType int, b
 		req["Raw"] = strconv.FormatInt(int64(raw), 10)
 	}
 	req["Userid"] = curSession.GetSessionId()
-	ret := action.handler(ws, req)
-	resp := common.ResponsePack(ret["error"].(common.ErrCode))
+	req["IsTls"] = r.TLS != nil
+	ret := action.handler(ws, req, r.Context())
+	resp := api.ResponsePack(ret["error"].(errcode.ErrCode))
 	resp["Action"] = actionName
 	resp["Result"] = ret["resultOrData"]
 	if txHash, ok := resp["Result"].(string); ok && action.pushFlag {
@@ -380,7 +433,7 @@ func (ws *WsServer) OnDataHandle(curSession *session.Session, messageType int, b
 	}
 	ws.respondToSession(curSession, resp)
 
-	return true
+	return nil
 }
 
 func (ws *WsServer) SetTxHashMap(txhash string, sessionid string) {
@@ -400,7 +453,7 @@ func (ws *WsServer) deleteTxHashs(sSessionId string) {
 }
 
 func (ws *WsServer) respondToSession(session *session.Session, resp map[string]interface{}) {
-	resp["Desc"] = common.ErrMessage[resp["Error"].(common.ErrCode)]
+	resp["Desc"] = errcode.ErrMessage[resp["Error"].(errcode.ErrCode)]
 	data, err := json.Marshal(resp)
 	if err != nil {
 		log.Error("Websocket response:", err)
@@ -432,7 +485,7 @@ func (ws *WsServer) PushTxResult(txHashStr string, resp map[string]interface{}) 
 }
 
 func (ws *WsServer) PushResult(resp map[string]interface{}) {
-	resp["Desc"] = common.ErrMessage[resp["Error"].(common.ErrCode)]
+	resp["Desc"] = errcode.ErrMessage[resp["Error"].(errcode.ErrCode)]
 	data, err := json.Marshal(resp)
 	if err != nil {
 		log.Error("Websocket PushResult:", err)
@@ -449,23 +502,11 @@ func (ws *WsServer) Broadcast(data []byte) error {
 }
 
 func (ws *WsServer) initTlsListen() (net.Listener, error) {
-
-	CertPath := config.Parameters.RestCertPath
-	KeyPath := config.Parameters.RestKeyPath
-
-	// load cert
-	cert, err := tls.LoadX509KeyPair(CertPath, KeyPath)
-	if err != nil {
-		log.Error("load keys fail", err)
-		return nil, err
-	}
-
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
+		GetCertificate: api.GetWssCertificate,
 	}
 
-	log.Info("TLS listen port is ", strconv.Itoa(int(config.Parameters.HttpWsPort)))
-	listener, err := tls.Listen("tcp", ":"+strconv.Itoa(int(config.Parameters.HttpWsPort)), tlsConfig)
+	listener, err := tls.Listen("tcp", ":"+strconv.Itoa(int(config.Parameters.HttpWssPort)), tlsConfig)
 	if err != nil {
 		log.Error(err)
 		return nil, err
@@ -478,12 +519,8 @@ func (ws *WsServer) GetClientsById(cliendID []byte) []*session.Session {
 	return sessions
 }
 
-func (ws *WsServer) GetNetNode() (*node.LocalNode, error) {
-	return ws.localNode, nil
-}
-
-func (ws *WsServer) GetWallet() (vault.Wallet, error) {
-	return ws.wallet, nil
+func (ws *WsServer) GetNetNode() *node.LocalNode {
+	return ws.localNode
 }
 
 func (ws *WsServer) NotifyWrongClients() {
@@ -493,23 +530,37 @@ func (ws *WsServer) NotifyWrongClients() {
 			return
 		}
 
-		localNode, err := ws.GetNetNode()
-		if err != nil {
-			return
-		}
+		localNode := ws.GetNetNode()
 
-		addr, pubkey, id, err := localNode.FindWsAddr(clientID)
+		var wsAddr, rpcAddr, localAddr string
+		var pubkey, id []byte
+		var err error
+
+		if client.IsTlsClient() {
+			wsAddr, rpcAddr, pubkey, id, err = localNode.FindWssAddr(clientID)
+			localAddr = localNode.GetWssAddr()
+		} else {
+			wsAddr, rpcAddr, pubkey, id, err = localNode.FindWsAddr(clientID)
+			localAddr = localNode.GetWsAddr()
+		}
 		if err != nil {
 			log.Errorf("Find websocket address error: %v", err)
 			return
 		}
 
-		if addr != localNode.GetWsAddr() {
-			resp := common.ResponsePack(common.WRONG_NODE)
-			resp["Result"] = common.NodeInfo(addr, pubkey, id)
+		if wsAddr != localAddr {
+			resp := api.ResponsePack(errcode.WRONG_NODE)
+			resp["Result"] = api.NodeInfo(wsAddr, rpcAddr, pubkey, id)
 			ws.respondToSession(client, resp)
 		}
 	})
+}
+
+func (ws *WsServer) startCheckingWrongClients() {
+	for {
+		time.Sleep(checkWrongClientsInterval)
+		ws.NotifyWrongClients()
+	}
 }
 
 func (ws *WsServer) sendInboundRelayMessageToClient(v interface{}) {

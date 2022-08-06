@@ -2,39 +2,45 @@ package por
 
 import (
 	"bytes"
+	"container/heap"
 	"errors"
 	"fmt"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/nknorg/nkn/common"
-	"github.com/nknorg/nkn/crypto"
-	"github.com/nknorg/nkn/event"
-	"github.com/nknorg/nkn/pb"
-	"github.com/nknorg/nkn/transaction"
-	"github.com/nknorg/nkn/util"
-	"github.com/nknorg/nkn/util/config"
-	"github.com/nknorg/nkn/util/log"
-	"github.com/nknorg/nkn/vault"
+	"github.com/nknorg/nkn/v2/block"
+	"github.com/nknorg/nkn/v2/common"
+	"github.com/nknorg/nkn/v2/config"
+	"github.com/nknorg/nkn/v2/crypto"
+	"github.com/nknorg/nkn/v2/event"
+	"github.com/nknorg/nkn/v2/pb"
+	"github.com/nknorg/nkn/v2/transaction"
+	"github.com/nknorg/nkn/v2/util"
+	"github.com/nknorg/nkn/v2/util/log"
+	"github.com/nknorg/nkn/v2/vault"
 )
 
 const (
-	sigChainElemCacheExpiration          = 10 * config.ConsensusTimeout
-	sigChainElemCacheCleanupInterval     = config.ConsensusDuration
-	srcSigChainCacheExpiration           = 10 * config.ConsensusTimeout
-	srcSigChainCacheCleanupInterval      = config.ConsensusDuration
+	sigChainElemCacheExpiration          = 10 * time.Second
+	sigChainElemCachePinnedExpiration    = 10 * config.ConsensusTimeout
+	sigChainElemCacheCleanupInterval     = 2 * time.Second
+	srcSigChainCacheExpiration           = 10 * time.Second
+	srcSigChainCachePinnedExpiration     = 10 * config.ConsensusTimeout
+	srcSigChainCacheCleanupInterval      = 2 * time.Second
 	destSigChainElemCacheExpiration      = 10 * config.ConsensusTimeout
 	destSigChainElemCacheCleanupInterval = config.ConsensusDuration
 	finalizedBlockCacheExpiration        = 10 * config.ConsensusTimeout
 	finalizedBlockCacheCleanupInterval   = config.ConsensusDuration
-	sigChainTxnCacheExpiration           = 50 * config.ConsensusTimeout
+	sigChainTxnCacheExpiration           = 10 * config.ConsensusTimeout
 	sigChainTxnCacheCleanupInterval      = config.ConsensusDuration
-	miningPorPackageCacheExpiration      = 50 * config.ConsensusTimeout
+	miningPorPackageCacheExpiration      = 10 * config.ConsensusTimeout
 	miningPorPackageCacheCleanupInterval = config.ConsensusDuration
-	vrfCacheExpiration                   = (SigChainMiningHeightOffset + config.MaxRollbackBlocks + 5) * config.ConsensusTimeout
+	vrfCacheExpiration                   = (SigChainMiningHeightOffset + config.SigChainBlockDelay + 5) * config.ConsensusTimeout
 	vrfCacheCleanupInterval              = config.ConsensusDuration
 	flushSigChainDelay                   = 500 * time.Millisecond
+	maxNumSigChainInCache                = 8
+	MaxNextHopChoice                     = 4 // should be >= nnet NumFingerSuccessors to avoid false positive
 )
 
 type PorServer struct {
@@ -49,14 +55,27 @@ type PorServer struct {
 	finalizedBlockCache       common.Cache
 
 	sync.RWMutex
-	miningPorPackageCache common.Cache
-	destSigChainElemCache common.Cache
+	miningPorPackageCache  common.Cache
+	destSigChainElemCache  common.Cache
+	sigChainObjectionCache common.Cache
 }
 
-var Store interface {
+// Store interface is used to avoid cyclic dependency
+type Store interface {
 	GetHeightByBlockHash(hash common.Uint256) (uint32, error)
-	GetID(publicKey []byte) ([]byte, error)
+	GetHeaderWithCache(hash common.Uint256) (*block.Header, error)
+	GetSigChainWithCache(hash common.Uint256) (*pb.SigChain, error)
+	GetID(publicKey []byte, height uint32) ([]byte, error)
 }
+
+var store Store
+
+// LocalNode interface is used to avoid cyclic dependency
+type LocalNode interface {
+	VerifySigChainObjection(sc *pb.SigChain, reporterID []byte, height uint32) (int, error)
+}
+
+var localNode LocalNode
 
 type vrfResult struct {
 	vrf   []byte
@@ -64,25 +83,59 @@ type vrfResult struct {
 }
 
 type sigChainElemInfo struct {
-	nextPubkey    []byte
-	prevNodeID    []byte
-	prevSignature []byte
-	mining        bool
-	blockHash     []byte
+	nextPubkey  []byte
+	prevNodeID  []byte
+	prevHash    []byte
+	blockHash   []byte
+	mining      bool
+	pinned      bool
+	backtracked bool
+	sigAlgo     pb.SigAlgo
+}
+
+type srcSigChain struct {
+	sigChain *pb.SigChain
+	pinned   bool
 }
 
 type destSigChainElem struct {
-	sigHash       []byte
-	sigChainElem  *pb.SigChainElem
-	prevSignature []byte
+	sigHash      []byte
+	sigChainElem *pb.SigChainElem
+	prevHash     []byte
+}
+
+type PinSigChainInfo struct {
+	PrevHash []byte
 }
 
 type BacktrackSigChainInfo struct {
 	DestSigChainElem *pb.SigChainElem
-	PrevSignature    []byte
+	PrevHash         []byte
 }
 
+type sigChainObjection struct {
+	reporterPubkey []byte
+	reporterID     []byte
+	skippedHop     int
+}
+
+type sigChainObjections []*sigChainObjection
+
 var porServer *PorServer
+
+type porPackageHeap []*PorPackage
+
+func (s porPackageHeap) Len() int            { return len(s) }
+func (s porPackageHeap) Swap(i, j int)       { s[i], s[j] = s[j], s[i] }
+func (s porPackageHeap) Less(i, j int) bool  { return bytes.Compare(s[i].SigHash, s[j].SigHash) < 0 }
+func (s *porPackageHeap) Push(x interface{}) { *s = append(*s, x.(*PorPackage)) }
+func (s *porPackageHeap) Pop() interface{} {
+	old := *s
+	n := len(old)
+	x := old[n-1]
+	*s = old[0 : n-1]
+	return x
+}
 
 func NewPorServer(account *vault.Account, id []byte) *PorServer {
 	ps := &PorServer{
@@ -97,11 +150,12 @@ func NewPorServer(account *vault.Account, id []byte) *PorServer {
 		finalizedBlockCache:       common.NewGoCache(finalizedBlockCacheExpiration, finalizedBlockCacheCleanupInterval),
 		miningPorPackageCache:     common.NewGoCache(miningPorPackageCacheExpiration, miningPorPackageCacheCleanupInterval),
 		destSigChainElemCache:     common.NewGoCache(destSigChainElemCacheExpiration, destSigChainElemCacheCleanupInterval),
+		sigChainObjectionCache:    common.NewGoCache(miningPorPackageCacheExpiration, miningPorPackageCacheCleanupInterval),
 	}
 	return ps
 }
 
-func InitPorServer(account *vault.Account, id []byte) error {
+func InitPorServer(account *vault.Account, id []byte, s Store, l LocalNode) error {
 	if porServer != nil {
 		return errors.New("PorServer already initialized")
 	}
@@ -109,13 +163,14 @@ func InitPorServer(account *vault.Account, id []byte) error {
 		return errors.New("ID is empty")
 	}
 	porServer = NewPorServer(account, id)
+	store = s
+	localNode = l
 	return nil
 }
 
 func GetPorServer() *PorServer {
 	if porServer == nil {
-		log.Error("PorServer not initialized")
-		panic("PorServer not initialized")
+		log.Fatal("PorServer not initialized")
 	}
 	return porServer
 }
@@ -142,36 +197,50 @@ func (ps *PorServer) GetOrComputeVrf(data []byte) ([]byte, []byte, error) {
 	return vrf, proof, nil
 }
 
-func (ps *PorServer) Sign(relayMessage *pb.Relay, nextPubkey, prevNodeID []byte, mining bool) error {
+func (ps *PorServer) UpdateRelayMessage(relayMessage *pb.Relay, nextPubkey, prevNodeID []byte, mining bool) error {
 	vrf, _, err := ps.GetOrComputeVrf(relayMessage.BlockHash)
 	if err != nil {
-		log.Error("Get or compute VRF error:", err)
 		return err
 	}
 
-	signature, err := pb.ComputeSignature(vrf, relayMessage.LastSignature, ps.id, nextPubkey, mining)
+	blockHash, err := common.Uint256ParseFromBytes(relayMessage.BlockHash)
 	if err != nil {
-		log.Error("Computing signature error:", err)
 		return err
 	}
 
-	ps.sigChainElemCache.Add(signature, &sigChainElemInfo{
-		nextPubkey:    nextPubkey,
-		prevNodeID:    prevNodeID,
-		prevSignature: relayMessage.LastSignature,
-		mining:        mining,
-		blockHash:     relayMessage.BlockHash,
+	sigAlgo := pb.SigAlgo_HASH
+	height, err := store.GetHeightByBlockHash(blockHash)
+	if err == nil {
+		if !config.AllowSigChainHashSignature.GetValueAtHeight(height) {
+			sigAlgo = pb.SigAlgo_SIGNATURE
+		}
+	}
+
+	sce := pb.NewSigChainElem(ps.id, nextPubkey, nil, vrf, nil, mining, sigAlgo)
+	hash, err := sce.Hash(relayMessage.LastHash)
+	if err != nil {
+		return err
+	}
+
+	ps.sigChainElemCache.Add(hash, &sigChainElemInfo{
+		nextPubkey:  nextPubkey,
+		prevNodeID:  prevNodeID,
+		prevHash:    relayMessage.LastHash,
+		blockHash:   relayMessage.BlockHash,
+		mining:      mining,
+		backtracked: false,
+		sigAlgo:     sigAlgo,
 	})
 
-	relayMessage.LastSignature = signature
+	relayMessage.LastHash = hash
 	relayMessage.SigChainLen++
 
 	return nil
 }
 
 func (ps *PorServer) CreateSigChainForClient(nonce, dataSize uint32, blockHash []byte, srcID, srcPubkey, destID, destPubkey, signature []byte, sigAlgo pb.SigAlgo) (*pb.SigChain, error) {
-	pubKey := ps.account.PubKey().EncodePoint()
-	sigChain, err := pb.NewSigChainWithSignature(
+	pubKey := ps.account.PubKey()
+	sigChain, err := pb.NewSigChain(
 		nonce,
 		dataSize,
 		blockHash,
@@ -185,26 +254,65 @@ func (ps *PorServer) CreateSigChainForClient(nonce, dataSize uint32, blockHash [
 		false,
 	)
 	if err != nil {
-		log.Error("New signature chain with signature error:", err)
 		return nil, err
 	}
-	ps.srcSigChainCache.Add(signature, sigChain)
+	ps.srcSigChainCache.Add(signature, &srcSigChain{sigChain: sigChain})
 	return sigChain, nil
 }
 
-func (ps *PorServer) GetSignature(sc *pb.SigChain) ([]byte, error) {
-	return sc.GetSignature()
-}
+func (ps *PorServer) GetMiningSigChainTxnHash(voteForHeight uint32) (common.Uint256, error) {
+	ps.RLock()
+	defer ps.RUnlock()
 
-func (ps *PorServer) LenOfSigChain(sc *pb.SigChain) int {
-	return sc.Length()
-}
+	var height uint32
+	if voteForHeight > SigChainMiningHeightOffset+config.SigChainBlockDelay {
+		height = voteForHeight - SigChainMiningHeightOffset - config.SigChainBlockDelay
+	}
 
-func (ps *PorServer) GetMiningSigChainTxnHash(height uint32) (common.Uint256, error) {
-	if v, ok := ps.miningPorPackageCache.Get([]byte(strconv.Itoa(int(height)))); ok {
-		if miningPorPackage, ok := v.(*PorPackage); ok {
-			if _, ok := ps.sigChainTxnCache.Get(miningPorPackage.TxHash); ok {
-				return common.Uint256ParseFromBytes(miningPorPackage.TxHash)
+	if v, ok := ps.miningPorPackageCache.Get([]byte(strconv.Itoa(int(voteForHeight)))); ok {
+		if p, ok := v.(*porPackageHeap); ok {
+			for i := 0; i < p.Len(); i++ {
+				porPkg := (*p)[i]
+				if v, ok := ps.sigChainObjectionCache.Get(porPkg.SigHash); ok {
+					if scos, ok := v.(sigChainObjections); ok {
+						if len(scos) >= MaxNextHopChoice {
+							verifiedCount := make(map[int]int)
+							for _, sco := range scos {
+								if len(sco.reporterID) == 0 {
+									id, err := store.GetID(sco.reporterPubkey, height)
+									if err != nil {
+										continue
+									}
+									sco.reporterID = id
+									i, err := localNode.VerifySigChainObjection(porPkg.SigChain, id, height)
+									if err != nil {
+										continue
+									}
+									sco.skippedHop = i
+								}
+								if sco.skippedHop > 0 {
+									verifiedCount[sco.skippedHop]++
+								}
+								if verifiedCount[sco.skippedHop] >= MaxNextHopChoice {
+									break
+								}
+							}
+							isSigChainInvalid := false
+							for _, count := range verifiedCount {
+								if count >= MaxNextHopChoice {
+									isSigChainInvalid = true
+									break
+								}
+							}
+							if isSigChainInvalid {
+								continue
+							}
+						}
+					}
+				}
+				if _, ok := ps.sigChainTxnCache.Get(porPkg.TxHash); ok {
+					return common.Uint256ParseFromBytes(porPkg.TxHash)
+				}
 			}
 		}
 	}
@@ -254,7 +362,13 @@ func (ps *PorServer) GetSigChainTxnByShortHash(shortHash []byte) (*transaction.T
 	return txn, nil
 }
 
-func (ps *PorServer) ShouldAddSigChainToCache(currentHeight, voteForHeight uint32, sigHash []byte) bool {
+func (ps *PorServer) ShouldAddSigChainToCache(currentHeight, voteForHeight uint32, sigHash []byte, replace bool) bool {
+	ps.RLock()
+	defer ps.RUnlock()
+	return ps.shouldAddSigChainToCache(currentHeight, voteForHeight, sigHash, replace)
+}
+
+func (ps *PorServer) shouldAddSigChainToCache(currentHeight, voteForHeight uint32, sigHash []byte, replace bool) bool {
 	if voteForHeight < currentHeight+SigChainPropagationHeightOffset {
 		return false
 	}
@@ -264,22 +378,25 @@ func (ps *PorServer) ShouldAddSigChainToCache(currentHeight, voteForHeight uint3
 	}
 
 	if v, ok := ps.miningPorPackageCache.Get([]byte(strconv.Itoa(int(voteForHeight)))); ok {
-		if currentMiningPorPkg, ok := v.(*PorPackage); ok {
-			return bytes.Compare(sigHash, currentMiningPorPkg.SigHash) < 0
+		if p, ok := v.(*porPackageHeap); ok {
+			if replace {
+				return bytes.Compare(sigHash, (*p)[p.Len()-1].SigHash) <= 0
+			}
+			return bytes.Compare(sigHash, (*p)[p.Len()-1].SigHash) < 0
 		}
 	}
 
 	return true
 }
 
-func VerifyID(sc *pb.SigChain) error {
+func VerifyID(sc *pb.SigChain, height uint32) error {
 	for i := range sc.Elems {
 		if i == 0 || (sc.IsComplete() && i == sc.Length()-1) {
 			continue
 		}
 
 		pk := sc.Elems[i-1].NextPubkey
-		id, err := Store.GetID(pk)
+		id, err := store.GetID(pk, height)
 		if err != nil {
 			return fmt.Errorf("get id of pk %x error: %v", pk, err)
 		}
@@ -294,7 +411,7 @@ func VerifyID(sc *pb.SigChain) error {
 }
 
 func (ps *PorServer) AddSigChainFromTx(txn *transaction.Transaction, currentHeight uint32) (*PorPackage, error) {
-	porPkg, err := NewPorPackage(txn, false)
+	porPkg, err := NewPorPackage(txn)
 	if err != nil {
 		return nil, err
 	}
@@ -302,16 +419,16 @@ func (ps *PorServer) AddSigChainFromTx(txn *transaction.Transaction, currentHeig
 	ps.Lock()
 	defer ps.Unlock()
 
-	if !ps.ShouldAddSigChainToCache(currentHeight, porPkg.VoteForHeight, porPkg.SigHash) {
+	if !ps.shouldAddSigChainToCache(currentHeight, porPkg.VoteForHeight, porPkg.SigHash, false) {
 		return nil, nil
 	}
 
-	err = VerifyID(porPkg.SigChain)
+	err = VerifyID(porPkg.SigChain, porPkg.Height)
 	if err != nil {
 		return nil, err
 	}
 
-	err = porPkg.SigChain.Verify()
+	err = VerifySigChainSignatures(porPkg.SigChain)
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +448,25 @@ func (ps *PorServer) AddSigChainFromTx(txn *transaction.Transaction, currentHeig
 		return nil, err
 	}
 
-	err = ps.miningPorPackageCache.Set([]byte(strconv.Itoa(int(porPkg.VoteForHeight))), porPkg)
+	var p *porPackageHeap
+	if v, ok := ps.miningPorPackageCache.Get([]byte(strconv.Itoa(int(porPkg.VoteForHeight)))); ok {
+		var ok bool
+		if p, ok = v.(*porPackageHeap); ok {
+			if p.Len() >= maxNumSigChainInCache {
+				(*p)[p.Len()-1] = porPkg
+				heap.Fix(p, p.Len()-1)
+			} else {
+				heap.Push(p, porPkg)
+			}
+		}
+	}
+
+	if p == nil {
+		p = &porPackageHeap{porPkg}
+		heap.Init(p)
+	}
+
+	err = ps.miningPorPackageCache.Set([]byte(strconv.Itoa(int(porPkg.VoteForHeight))), p)
 	if err != nil {
 		return nil, err
 	}
@@ -341,13 +476,30 @@ func (ps *PorServer) AddSigChainFromTx(txn *transaction.Transaction, currentHeig
 	return porPkg, nil
 }
 
-func (ps *PorServer) ShouldSignDestSigChainElem(blockHash, lastSignature []byte, sigChainLen int) bool {
+func (ps *PorServer) ShouldSignDestSigChainElem(blockHash, lastHash []byte, sigChainLen int) bool {
+	ps.RLock()
+	defer ps.RUnlock()
+	return ps.shouldSignDestSigChainElem(blockHash, lastHash, sigChainLen)
+}
+
+func (ps *PorServer) shouldSignDestSigChainElem(blockHash, lastHash []byte, sigChainLen int) bool {
 	if _, ok := ps.finalizedBlockCache.Get(blockHash); ok {
 		return false
 	}
+
+	blockHashUint256, err := common.Uint256ParseFromBytes(blockHash)
+	if err != nil {
+		return false
+	}
+
+	height, err := store.GetHeightByBlockHash(blockHashUint256)
+	if err != nil {
+		return false
+	}
+
 	if v, ok := ps.destSigChainElemCache.Get(blockHash); ok {
 		if currentDestSigChainElem, ok := v.(*destSigChainElem); ok {
-			sigHash := pb.ComputeSignatureHash(lastSignature, sigChainLen)
+			sigHash := pb.ComputeSignatureHash(lastHash, sigChainLen, height, 0)
 			if bytes.Compare(sigHash, currentDestSigChainElem.sigHash) >= 0 {
 				return false
 			}
@@ -356,35 +508,118 @@ func (ps *PorServer) ShouldSignDestSigChainElem(blockHash, lastSignature []byte,
 	return true
 }
 
-func (ps *PorServer) AddDestSigChainElem(blockHash, lastSignature []byte, sigChainLen int, destElem *pb.SigChainElem) (bool, error) {
+func (ps *PorServer) AddDestSigChainElem(blockHash, lastHash []byte, sigChainLen int, destElem *pb.SigChainElem) (bool, error) {
 	ps.Lock()
 	defer ps.Unlock()
 
-	if !ps.ShouldSignDestSigChainElem(blockHash, lastSignature, sigChainLen) {
+	if !ps.shouldSignDestSigChainElem(blockHash, lastHash, sigChainLen) {
 		return false, nil
 	}
 
-	err := ps.destSigChainElemCache.Set(blockHash, &destSigChainElem{
-		sigHash:       pb.ComputeSignatureHash(lastSignature, sigChainLen),
-		sigChainElem:  destElem,
-		prevSignature: lastSignature,
+	blockHashUint256, err := common.Uint256ParseFromBytes(blockHash)
+	if err != nil {
+		return false, err
+	}
+
+	height, err := store.GetHeightByBlockHash(blockHashUint256)
+	if err != nil {
+		return false, err
+	}
+
+	err = ps.destSigChainElemCache.Set(blockHash, &destSigChainElem{
+		sigHash:      pb.ComputeSignatureHash(lastHash, sigChainLen, height, 0),
+		sigChainElem: destElem,
+		prevHash:     lastHash,
 	})
 	if err != nil {
 		return false, err
 	}
 
+	event.Queue.Notify(event.PinSigChain, &PinSigChainInfo{
+		PrevHash: lastHash,
+	})
+
 	return true, nil
 }
 
-func (ps *PorServer) BacktrackSigChain(elems []*pb.SigChainElem, signature, senderPubkey []byte) ([]*pb.SigChainElem, []byte, []byte, error) {
-	v, ok := ps.sigChainElemCache.Get(signature)
+// PinSigChain extends the cache expiration of a key
+func (ps *PorServer) PinSigChain(hash, senderPubkey []byte) ([]byte, []byte, error) {
+	v, ok := ps.sigChainElemCache.Get(hash)
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("sigchain element with signature %x not found", signature)
+		return nil, nil, fmt.Errorf("sigchain element with hash %x not found", hash)
 	}
 
 	scei, ok := v.(*sigChainElemInfo)
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("failed to decode cached sigchain element info")
+		return nil, nil, errors.New("failed to decode cached sigchain element info")
+	}
+
+	if scei.pinned {
+		return nil, nil, errors.New("sigchain has already been pinned")
+	}
+
+	if senderPubkey != nil && !bytes.Equal(senderPubkey, scei.nextPubkey) {
+		return nil, nil, fmt.Errorf("sender pubkey %x is different from expected value %x", senderPubkey, scei.nextPubkey)
+	}
+
+	err := ps.sigChainElemCache.SetWithExpiration(hash, scei, sigChainElemCachePinnedExpiration)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return scei.prevHash, scei.prevNodeID, nil
+}
+
+// PinSigChainSuccess marks a sigchain as pinned to avoid it being pinned
+// multiple times.
+func (ps *PorServer) PinSigChainSuccess(hash []byte) {
+	if v, ok := ps.sigChainElemCache.Get(hash); ok {
+		if scei, ok := v.(*sigChainElemInfo); ok {
+			scei.pinned = true
+		}
+	}
+}
+
+// PinSrcSigChain marks a src sigchain as pinned to avoid it being pinned
+// multiple times.
+func (ps *PorServer) PinSrcSigChain(signature []byte) error {
+	v, ok := ps.srcSigChainCache.Get(signature)
+	if !ok {
+		return fmt.Errorf("src sigchain with signature %x not found", signature)
+	}
+
+	ssc, ok := v.(*srcSigChain)
+	if !ok {
+		return fmt.Errorf("failed to decode cached src sigchain %x", signature)
+	}
+
+	if ssc.pinned {
+		return errors.New("src sigchain has already been pinned")
+	}
+
+	ssc.pinned = true
+
+	err := ps.srcSigChainCache.SetWithExpiration(signature, ssc, srcSigChainCachePinnedExpiration)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (ps *PorServer) BacktrackSigChain(elems []*pb.SigChainElem, hash, senderPubkey []byte) ([]*pb.SigChainElem, []byte, []byte, error) {
+	v, ok := ps.sigChainElemCache.Get(hash)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("sigchain element with hash %x not found", hash)
+	}
+
+	scei, ok := v.(*sigChainElemInfo)
+	if !ok {
+		return nil, nil, nil, errors.New("failed to decode cached sigchain element info")
+	}
+
+	if scei.backtracked {
+		return nil, nil, nil, errors.New("sigchain has already been backtracked")
 	}
 
 	if senderPubkey != nil && !bytes.Equal(senderPubkey, scei.nextPubkey) {
@@ -400,25 +635,53 @@ func (ps *PorServer) BacktrackSigChain(elems []*pb.SigChainElem, signature, send
 		return nil, nil, nil, fmt.Errorf("get or compute VRF error: %v", err)
 	}
 
-	sce := pb.NewSigChainElem(ps.id, scei.nextPubkey, signature, vrf, proof, scei.mining)
+	var signature []byte
+	switch scei.sigAlgo {
+	case pb.SigAlgo_SIGNATURE:
+		signature, err = crypto.Sign(ps.account.PrivKey(), hash)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("sign error: %v", err)
+		}
+	case pb.SigAlgo_HASH:
+		signature = hash
+	default:
+		return nil, nil, nil, fmt.Errorf("unknown sigAlgo: %v", scei.sigAlgo)
+	}
 
+	sce := pb.NewSigChainElem(ps.id, scei.nextPubkey, signature, vrf, proof, scei.mining, scei.sigAlgo)
 	elems = append([]*pb.SigChainElem{sce}, elems...)
 
-	return elems, scei.prevSignature, scei.prevNodeID, nil
+	return elems, scei.prevHash, scei.prevNodeID, nil
 }
 
-func (ps *PorServer) GetSrcSigChainFromCache(signature []byte) (*pb.SigChain, error) {
+// BacktrackSigChainSuccess marks a sigchain as backtracked to avoid it being
+// backtracked multiple times.
+func (ps *PorServer) BacktrackSigChainSuccess(hash []byte) {
+	if v, ok := ps.sigChainElemCache.Get(hash); ok {
+		if scei, ok := v.(*sigChainElemInfo); ok {
+			scei.backtracked = true
+		}
+	}
+}
+
+// PopSrcSigChainFromCache returns src sigchain and removes it from cache.
+func (ps *PorServer) PopSrcSigChainFromCache(signature []byte) (*pb.SigChain, error) {
 	v, ok := ps.srcSigChainCache.Get(signature)
 	if !ok {
 		return nil, fmt.Errorf("src sigchain with signature %x not found", signature)
 	}
 
-	sigChain, ok := v.(*pb.SigChain)
+	ssc, ok := v.(*srcSigChain)
 	if !ok {
-		return nil, fmt.Errorf("failed to decode cached src sigchain from")
+		return nil, fmt.Errorf("failed to decode cached src sigchain %x", signature)
 	}
 
-	return sigChain, nil
+	err := ps.srcSigChainCache.Delete(signature)
+	if err != nil {
+		return nil, err
+	}
+
+	return ssc.sigChain, nil
 }
 
 func (ps *PorServer) FlushSigChain(blockHash []byte) {
@@ -433,8 +696,115 @@ func (ps *PorServer) FlushSigChain(blockHash []byte) {
 			log.Infof("Start backtracking sigchain with sighash %x", sce.sigHash)
 			event.Queue.Notify(event.BacktrackSigChain, &BacktrackSigChainInfo{
 				DestSigChainElem: sce.sigChainElem,
-				PrevSignature:    sce.prevSignature,
+				PrevHash:         sce.prevHash,
 			})
 		}
 	}
+}
+
+func (ps *PorServer) AddSigChainObjection(currentHeight, voteForHeight uint32, sigHash, reporterPubkey []byte) bool {
+	var height uint32
+	if voteForHeight > SigChainMiningHeightOffset+config.SigChainBlockDelay {
+		height = voteForHeight - SigChainMiningHeightOffset - config.SigChainBlockDelay
+	}
+	if !config.SigChainObjection.GetValueAtHeight(height) {
+		return false
+	}
+
+	ps.Lock()
+	defer ps.Unlock()
+
+	if !ps.shouldAddSigChainToCache(currentHeight, voteForHeight, sigHash, true) {
+		return false
+	}
+
+	sco := &sigChainObjection{reporterPubkey: reporterPubkey}
+
+	var porPkg *PorPackage
+	if v, ok := ps.miningPorPackageCache.Get([]byte(strconv.Itoa(int(voteForHeight)))); ok {
+		if p, ok := v.(*porPackageHeap); ok {
+			for i := 0; i < p.Len(); i++ {
+				if bytes.Compare((*p)[i].SigHash, sigHash) == 0 {
+					porPkg = (*p)[i]
+					break
+				}
+			}
+		}
+	}
+
+	if porPkg != nil {
+		reporterID, err := store.GetID(reporterPubkey, porPkg.Height)
+		if err != nil {
+			return false
+		}
+		sco.reporterID = reporterID
+		i, err := localNode.VerifySigChainObjection(porPkg.SigChain, reporterID, porPkg.Height)
+		if err != nil {
+			return false
+		}
+		sco.skippedHop = i
+	}
+
+	var scos sigChainObjections
+	if v, ok := ps.sigChainObjectionCache.Get(sigHash); ok {
+		var ok bool
+		if scos, ok = v.(sigChainObjections); ok {
+			verifiedCount := make(map[int]int)
+			needVerify := false
+			for _, s := range scos {
+				if bytes.Equal(s.reporterPubkey, reporterPubkey) {
+					return false
+				}
+				if s.skippedHop > 0 {
+					verifiedCount[s.skippedHop]++
+				}
+				if len(s.reporterID) == 0 {
+					needVerify = true
+				}
+			}
+
+			for _, count := range verifiedCount {
+				if count >= MaxNextHopChoice {
+					return false
+				}
+			}
+
+			if porPkg != nil && needVerify {
+				verifiedScos := sigChainObjections{}
+				verifiedCount := make(map[int]int)
+				for _, s := range scos {
+					reporterID, err := store.GetID(s.reporterPubkey, porPkg.Height)
+					if err != nil {
+						continue
+					}
+					s.reporterID = reporterID
+					i, err := localNode.VerifySigChainObjection(porPkg.SigChain, reporterID, porPkg.Height)
+					if err != nil {
+						continue
+					}
+					s.skippedHop = i
+					verifiedScos = append(verifiedScos, s)
+					verifiedCount[s.skippedHop]++
+				}
+				scos = verifiedScos
+
+				for _, count := range verifiedCount {
+					if count >= MaxNextHopChoice {
+						ps.sigChainObjectionCache.Set(sigHash, scos)
+						return false
+					}
+				}
+			}
+
+			scos = append(scos, sco)
+		}
+	}
+
+	if len(scos) == 0 {
+		scos = sigChainObjections{sco}
+	}
+
+	ps.sigChainObjectionCache.Set(sigHash, scos)
+
+	return true
 }

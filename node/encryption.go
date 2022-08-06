@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/nknorg/nkn/crypto/ed25519"
-	"github.com/nknorg/nkn/pb"
-	"github.com/nknorg/nkn/util/log"
+	"github.com/golang/protobuf/proto"
+	"github.com/nknorg/nkn/v2/crypto/ed25519"
+	"github.com/nknorg/nkn/v2/pb"
+	"github.com/nknorg/nkn/v2/util/log"
 	nnetnode "github.com/nknorg/nnet/node"
 	"golang.org/x/crypto/nacl/box"
 )
@@ -43,7 +43,7 @@ func (localNode *LocalNode) computeSharedKey(remotePublicKey []byte) (*[sharedKe
 
 func (localNode *LocalNode) encryptMessage(msg []byte, rn *nnetnode.RemoteNode) []byte {
 	var sharedKey *[sharedKeySize]byte
-	if remoteNode := localNode.getNbrByNNetNode(rn); remoteNode != nil {
+	if remoteNode := localNode.getNeighborByNNetNode(rn); remoteNode != nil {
 		sharedKey = remoteNode.sharedKey
 	}
 	return encryptMessage(msg, sharedKey)
@@ -51,7 +51,7 @@ func (localNode *LocalNode) encryptMessage(msg []byte, rn *nnetnode.RemoteNode) 
 
 func (localNode *LocalNode) decryptMessage(msg []byte, rn *nnetnode.RemoteNode) ([]byte, error) {
 	var sharedKey *[sharedKeySize]byte
-	if remoteNode := localNode.getNbrByNNetNode(rn); remoteNode != nil {
+	if remoteNode := localNode.getNeighborByNNetNode(rn); remoteNode != nil {
 		sharedKey = remoteNode.sharedKey
 	} else if rn.Data != nil {
 		nodeData := &pb.NodeData{}

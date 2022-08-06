@@ -3,13 +3,12 @@ package signature
 import (
 	"fmt"
 
-	. "github.com/nknorg/nkn/common"
-	"github.com/nknorg/nkn/crypto"
-	"github.com/nknorg/nkn/program"
+	"github.com/nknorg/nkn/v2/common"
+	"github.com/nknorg/nkn/v2/crypto"
+	"github.com/nknorg/nkn/v2/program"
 )
 
 func VerifySignableData(signableData SignableData) error {
-
 	hashes, err := signableData.GetProgramHashes()
 	if err != nil {
 		return err
@@ -20,9 +19,8 @@ func VerifySignableData(signableData SignableData) error {
 		return fmt.Errorf("the number of data hashes %d is different with number of programs %d", len(hashes), len(programs))
 	}
 
-	programs = signableData.GetPrograms()
 	for i := 0; i < len(programs); i++ {
-		temp, _ := ToCodeHash(programs[i].Code)
+		temp, _ := common.ToCodeHash(programs[i].Code)
 		if hashes[i] != temp {
 			return fmt.Errorf("The data hashes %v is different with corresponding program code %v", hashes[i], temp)
 		}
@@ -32,7 +30,7 @@ func VerifySignableData(signableData SignableData) error {
 			return err
 		}
 
-		pubkey, err := crypto.NewPubKeyFromBytes(pk)
+		err = crypto.CheckPublicKey(pk)
 		if err != nil {
 			return err
 		}
@@ -42,7 +40,7 @@ func VerifySignableData(signableData SignableData) error {
 			return err
 		}
 
-		_, err = VerifySignature(signableData, pubkey, signature)
+		_, err = VerifySignature(signableData, pk, signature)
 		if err != nil {
 			return err
 		}
@@ -51,10 +49,10 @@ func VerifySignableData(signableData SignableData) error {
 	return nil
 }
 
-func VerifySignature(signableData SignableData, pubkey *crypto.PubKey, signature []byte) (bool, error) {
-	err := crypto.Verify(*pubkey, GetHashForSigning(signableData), signature)
+func VerifySignature(signableData SignableData, pubKey, signature []byte) (bool, error) {
+	err := crypto.Verify(pubKey, GetHashForSigning(signableData), signature)
 	if err != nil {
-		return false, fmt.Errorf("[Validation], VerifySignature failed: %v", err)
+		return false, fmt.Errorf("verify signature error: %v", err)
 	} else {
 		return true, nil
 	}

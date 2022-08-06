@@ -5,14 +5,24 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/nknorg/nkn/pb"
-	"github.com/nknorg/nkn/util/log"
+	"github.com/golang/protobuf/proto"
+	"github.com/nknorg/nkn/v2/pb"
+	"github.com/nknorg/nkn/v2/util/log"
 	nnetnode "github.com/nknorg/nnet/node"
 	"github.com/nknorg/nnet/overlay/chord"
 )
 
-type ChordRemoteNodeInfo nnetnode.RemoteNode
+type ChordRemoteNodeInfo struct {
+	localNode  *LocalNode
+	remoteNode *nnetnode.RemoteNode
+}
+
+func newChordRemoteNodeInfo(localNode *LocalNode, remoteNode *nnetnode.RemoteNode) *ChordRemoteNodeInfo {
+	return &ChordRemoteNodeInfo{
+		localNode:  localNode,
+		remoteNode: remoteNode,
+	}
+}
 
 type ChordInfo struct {
 	LocalNode    *LocalNode                     `json:"localNode"`
@@ -25,10 +35,10 @@ func (localNode *LocalNode) GetNeighborInfo() []*RemoteNode {
 	return localNode.GetNeighbors(nil)
 }
 
-func (rn *ChordRemoteNodeInfo) MarshalJSON() ([]byte, error) {
+func (crn *ChordRemoteNodeInfo) MarshalJSON() ([]byte, error) {
 	var out map[string]interface{}
 
-	buf, err := json.Marshal(rn.Node.Node)
+	buf, err := json.Marshal(crn.remoteNode.Node.Node)
 	if err != nil {
 		return nil, err
 	}
@@ -39,16 +49,22 @@ func (rn *ChordRemoteNodeInfo) MarshalJSON() ([]byte, error) {
 	}
 
 	nodeData := &pb.NodeData{}
-	err = proto.Unmarshal(rn.Node.Node.Data, nodeData)
+	err = proto.Unmarshal(crn.remoteNode.Node.Node.Data, nodeData)
 	if err != nil {
 		return nil, err
 	}
 
 	delete(out, "data")
-	out["id"] = hex.EncodeToString(rn.Node.Node.Id)
-	out["isOutbound"] = rn.IsOutbound
-	out["roundTripTime"] = (*nnetnode.RemoteNode)(rn).GetRoundTripTime() / time.Millisecond
+	out["id"] = hex.EncodeToString(crn.remoteNode.Node.Node.Id)
+	out["isOutbound"] = crn.remoteNode.IsOutbound
+	out["roundTripTime"] = crn.remoteNode.GetRoundTripTime() / time.Millisecond
 	out["protocolVersion"] = nodeData.ProtocolVersion
+
+	out["connTime"] = 0
+	nbr := crn.localNode.getNeighborByNNetNode(crn.remoteNode)
+	if nbr != nil {
+		out["connTime"] = time.Since(nbr.Node.startTime) / time.Second
+	}
 
 	return json.Marshal(out)
 }
@@ -64,11 +80,11 @@ func (localNode *LocalNode) GetChordInfo() *ChordInfo {
 	fingerTable := make(map[int][]*ChordRemoteNodeInfo)
 
 	for _, n := range c.Successors() {
-		successors = append(successors, (*ChordRemoteNodeInfo)(n))
+		successors = append(successors, newChordRemoteNodeInfo(localNode, n))
 	}
 
 	for _, n := range c.Predecessors() {
-		predecessors = append(predecessors, (*ChordRemoteNodeInfo)(n))
+		predecessors = append(predecessors, newChordRemoteNodeInfo(localNode, n))
 	}
 
 	for i, nodes := range c.FingerTable() {
@@ -77,7 +93,7 @@ func (localNode *LocalNode) GetChordInfo() *ChordInfo {
 		}
 
 		for _, n := range nodes {
-			fingerTable[i] = append(fingerTable[i], (*ChordRemoteNodeInfo)(n))
+			fingerTable[i] = append(fingerTable[i], newChordRemoteNodeInfo(localNode, n))
 		}
 	}
 

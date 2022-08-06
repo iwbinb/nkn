@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/nknorg/nkn/crypto"
-	"github.com/nknorg/nkn/pb"
-	"github.com/nknorg/nkn/util/log"
+	"github.com/golang/protobuf/proto"
+	"github.com/nknorg/nkn/v2/crypto"
+	"github.com/nknorg/nkn/v2/pb"
+	"github.com/nknorg/nkn/v2/util/log"
 	nnetnode "github.com/nknorg/nnet/node"
 	nnetpb "github.com/nknorg/nnet/protobuf"
 )
@@ -44,9 +44,9 @@ func (localNode *LocalNode) SerializeMessage(unsignedMsg *pb.UnsignedMessage, si
 func (remoteNode *RemoteNode) SendBytesAsync(buf []byte) error {
 	err := remoteNode.localNode.nnet.SendBytesDirectAsync(buf, remoteNode.nnetNode)
 	if err != nil {
-		log.Errorf("Error sending async messge to node %v, removing node.", err.Error())
+		log.Debugf("Error sending async messge to node %v, removing node.", err.Error())
 		remoteNode.CloseConn()
-		remoteNode.localNode.DelNbrNode(remoteNode.GetID())
+		remoteNode.localNode.removeNeighborNode(remoteNode.GetID())
 	}
 	return err
 }
@@ -58,7 +58,7 @@ func (remoteNode *RemoteNode) SendBytesSync(buf []byte) ([]byte, error) {
 func (remoteNode *RemoteNode) SendBytesSyncWithTimeout(buf []byte, replyTimeout time.Duration) ([]byte, error) {
 	reply, _, err := remoteNode.localNode.nnet.SendBytesDirectSyncWithTimeout(buf, remoteNode.nnetNode, replyTimeout)
 	if err != nil {
-		log.Errorf("Error sending sync messge to node: %v", err.Error())
+		log.Debugf("Error sending sync messge to node: %v", err.Error())
 	}
 	return reply, err
 }
@@ -66,9 +66,9 @@ func (remoteNode *RemoteNode) SendBytesSyncWithTimeout(buf []byte, replyTimeout 
 func (remoteNode *RemoteNode) SendBytesReply(replyToID, buf []byte) error {
 	err := remoteNode.localNode.nnet.SendBytesDirectReply(replyToID, buf, remoteNode.nnetNode)
 	if err != nil {
-		log.Errorf("Error sending async messge to node: %v, removing node.", err.Error())
+		log.Debugf("Error sending async messge to node: %v, removing node.", err.Error())
 		remoteNode.CloseConn()
-		remoteNode.localNode.DelNbrNode(remoteNode.GetID())
+		remoteNode.localNode.removeNeighborNode(remoteNode.GetID())
 	}
 	return err
 }
@@ -77,18 +77,18 @@ func (localNode *LocalNode) remoteMessageRouted(remoteMessage *nnetnode.RemoteMe
 	if remoteMessage.Msg.MessageType == nnetpb.BYTES {
 		err := localNode.maybeAddRemoteNode(remoteMessage.RemoteNode)
 		if err != nil {
-			log.Errorf("Add remote node error: %v", err)
+			log.Warningf("Add remote node error: %v", err)
 		}
 
 		for _, remoteNode := range remoteNodes {
 			err = localNode.maybeAddRemoteNode(remoteNode)
 			if err != nil {
-				log.Errorf("Add remote node error: %v", err)
+				log.Warningf("Add remote node error: %v", err)
 			}
 		}
 
 		var senderNode *Node
-		senderRemoteNode := localNode.getNbrByNNetNode(remoteMessage.RemoteNode)
+		senderRemoteNode := localNode.getNeighborByNNetNode(remoteMessage.RemoteNode)
 		if senderRemoteNode != nil {
 			senderNode = senderRemoteNode.Node
 		} else if remoteMessage.RemoteNode == nil {
@@ -150,14 +150,14 @@ func (localNode *LocalNode) remoteMessageRouted(remoteMessage *nnetnode.RemoteMe
 			}
 
 			hash := sha256.Sum256(signedMsg.Message)
-			err = crypto.Verify(*pubKey, hash[:], signedMsg.Signature)
+			err = crypto.Verify(pubKey, hash[:], signedMsg.Signature)
 			if err != nil {
 				log.Errorf("Verify signature error: %v", err)
 				return nil, nil, nil, false
 			}
 		}
 
-		if unsignedMsg.MessageType == pb.RELAY {
+		if unsignedMsg.MessageType == pb.MessageType_RELAY {
 			relayMessage := &pb.Relay{}
 			err = proto.Unmarshal(unsignedMsg.Message, relayMessage)
 			if err != nil {
@@ -172,16 +172,16 @@ func (localNode *LocalNode) remoteMessageRouted(remoteMessage *nnetnode.RemoteMe
 
 			var nextHop *RemoteNode
 			if len(remoteNodes) > 0 {
-				nextHop = localNode.getNbrByNNetNode(remoteNodes[0])
+				nextHop = localNode.getNeighborByNNetNode(remoteNodes[0])
 				if nextHop == nil {
 					log.Errorf("cannot get next hop neighbor node")
 					return nil, nil, nil, false
 				}
 			}
 
-			err = localNode.relayer.signRelayMessage(relayMessage, nextHop, senderRemoteNode)
+			err = localNode.relayer.updateRelayMessage(relayMessage, nextHop, senderRemoteNode)
 			if err != nil {
-				log.Errorf("sign relay message error: %v", err)
+				log.Errorf("process relay message error: %v", err)
 				return nil, nil, nil, false
 			}
 
@@ -206,7 +206,7 @@ func (localNode *LocalNode) remoteMessageRouted(remoteMessage *nnetnode.RemoteMe
 			localNode.IncrementRelayMessageCount()
 		}
 
-		if unsignedMsg.MessageType == pb.TRANSACTIONS && nnetLocalNode != nil {
+		if unsignedMsg.MessageType == pb.MessageType_TRANSACTIONS && nnetLocalNode != nil {
 			txnMsg := &pb.Transactions{}
 			err = proto.Unmarshal(unsignedMsg.Message, txnMsg)
 			if err != nil {
@@ -228,14 +228,14 @@ func (localNode *LocalNode) remoteMessageRouted(remoteMessage *nnetnode.RemoteMe
 				var reply []byte
 				reply, err = localNode.receiveMessage(senderNode, unsignedMsg)
 				if err != nil {
-					log.Warningf("Error handling msg: %v", err)
+					log.Infof("Error handling msg: %v", err)
 					return nil, nil, nil, false
 				}
 
 				if len(reply) > 0 && senderRemoteNode != nil {
 					err = senderRemoteNode.SendBytesReply(remoteMessage.Msg.MessageId, reply)
 					if err != nil {
-						log.Errorf("Error sending reply: %v", err)
+						log.Infof("Error sending reply: %v", err)
 						return nil, nil, nil, false
 					}
 				}
@@ -281,8 +281,8 @@ func (localNode *LocalNode) receiveMessage(sender *Node, unsignedMsg *pb.Unsigne
 
 // checkMessageType checks if a message type is allowed
 func checkMessageType(messageType pb.MessageType) error {
-	if messageType == pb.MESSAGE_TYPE_PLACEHOLDER_DO_NOT_USE {
-		return fmt.Errorf("message type %s should not be used", pb.MESSAGE_TYPE_PLACEHOLDER_DO_NOT_USE.String())
+	if messageType == pb.MessageType_MESSAGE_TYPE_PLACEHOLDER_DO_NOT_USE {
+		return fmt.Errorf("message type %s should not be used", pb.MessageType_MESSAGE_TYPE_PLACEHOLDER_DO_NOT_USE.String())
 	}
 
 	return nil

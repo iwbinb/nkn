@@ -1,23 +1,11 @@
 syntax = "proto3";
+option go_package = "./pb";
 
 package pb;
 
-import "github.com/gogo/protobuf/gogoproto/gogo.proto";
-
-option (gogoproto.gostring_all) = true;
-option (gogoproto.goproto_stringer_all) = false;
-option (gogoproto.stringer_all) = true;
-option (gogoproto.marshaler_all) = true;
-option (gogoproto.sizer_all) = true;
-option (gogoproto.unmarshaler_all) = true;
- // For tests
-option (gogoproto.testgen_all) = true;
-option (gogoproto.equal_all) = true;
-option (gogoproto.populate_all) = true;
-
 enum SigAlgo {
   SIGNATURE = 0;
-  VRF       = 1;
+  HASH      = 1;
 }
 
 message SigChainElem {

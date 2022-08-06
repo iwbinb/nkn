@@ -3,22 +3,27 @@ package common
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 )
 
 const UINT256SIZE = 32
 
-var EmptyUint256 Uint256
-
 type Uint256 [UINT256SIZE]uint8
+
+var EmptyUint256 Uint256
+var MaxUint256 = Uint256{
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+}
 
 func (u *Uint256) CompareTo(o Uint256) int {
 	x := u.ToArray()
 	y := o.ToArray()
 
-	for i := len(x) - 1; i >= 0; i-- {
+	for i := 0; i < len(x); i++ {
 		if x[i] > y[i] {
 			return 1
 		}
@@ -72,8 +77,12 @@ func (u *Uint256) ToHexString() string {
 func Uint256ParseFromBytes(f []byte) (hash Uint256, err error) {
 	copy(hash[:], f)
 	if len(f) != UINT256SIZE {
-		err = errors.New("[Common]: Uint256ParseFromBytes err, len != 32")
+		err = fmt.Errorf("uint256 bytes wrong size %d, expecting %d", len(f), UINT256SIZE)
 	}
 
 	return hash, err
+}
+
+func U256Equal(a, b Uint256) bool {
+	return bytes.Equal(a[:], b[:])
 }

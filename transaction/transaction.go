@@ -2,22 +2,23 @@ package transaction
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 
-	"github.com/gogo/protobuf/proto"
-	. "github.com/nknorg/nkn/common"
-	"github.com/nknorg/nkn/common/serialization"
-	"github.com/nknorg/nkn/crypto"
-	"github.com/nknorg/nkn/pb"
-	"github.com/nknorg/nkn/program"
-	"github.com/nknorg/nkn/signature"
+	"github.com/golang/protobuf/proto"
+	"github.com/nknorg/nkn/v2/common"
+	"github.com/nknorg/nkn/v2/common/serialization"
+	"github.com/nknorg/nkn/v2/pb"
+	"github.com/nknorg/nkn/v2/program"
+	"github.com/nknorg/nkn/v2/signature"
 )
 
 type Transaction struct {
 	*pb.Transaction
-	hash                *Uint256
+	hash                *common.Uint256
+	size                uint32
 	isSignatureVerified bool
 }
 
@@ -32,7 +33,7 @@ func (tx *Transaction) Unmarshal(buf []byte) error {
 	return proto.Unmarshal(buf, tx.Transaction)
 }
 
-func NewMsgTx(payload *pb.Payload, nonce uint64, fee Fixed64, attrs []byte) *pb.Transaction {
+func NewMsgTx(payload *pb.Payload, nonce uint64, fee common.Fixed64, attrs []byte) *pb.Transaction {
 	unsigned := &pb.UnsignedTx{
 		Payload:    payload,
 		Nonce:      nonce,
@@ -97,13 +98,16 @@ func (tx *Transaction) DeserializeUnsigned(r io.Reader) error {
 	return nil
 }
 
-func (tx *Transaction) GetSize() int {
-	marshaledTx, _ := tx.Marshal()
-	return len(marshaledTx)
+func (tx *Transaction) GetSize() uint32 {
+	if tx.size == 0 {
+		marshaledTx, _ := tx.Marshal()
+		tx.size = uint32(len(marshaledTx))
+	}
+	return tx.size
 }
 
-func (tx *Transaction) GetProgramHashes() ([]Uint160, error) {
-	hashes := []Uint160{}
+func (tx *Transaction) GetProgramHashes() ([]common.Uint160, error) {
+	hashes := []common.Uint160{}
 
 	payload, err := Unpack(tx.UnsignedTx.Payload)
 	if err != nil {
@@ -111,66 +115,68 @@ func (tx *Transaction) GetProgramHashes() ([]Uint160, error) {
 	}
 
 	switch tx.UnsignedTx.Payload.Type {
-	case pb.SIG_CHAIN_TXN_TYPE:
+	case pb.PayloadType_SIG_CHAIN_TXN_TYPE:
 		sender := payload.(*pb.SigChainTxn).Submitter
-		hashes = append(hashes, BytesToUint160(sender))
-	case pb.TRANSFER_ASSET_TYPE:
+		hashes = append(hashes, common.BytesToUint160(sender))
+	case pb.PayloadType_TRANSFER_ASSET_TYPE:
 		sender := payload.(*pb.TransferAsset).Sender
-		hashes = append(hashes, BytesToUint160(sender))
-	case pb.COINBASE_TYPE:
+		hashes = append(hashes, common.BytesToUint160(sender))
+	case pb.PayloadType_COINBASE_TYPE:
 		sender := payload.(*pb.Coinbase).Sender
-		hashes = append(hashes, BytesToUint160(sender))
-	case pb.REGISTER_NAME_TYPE:
-		pubkey := payload.(*pb.RegisterName).Registrant
-		publicKey, err := crypto.NewPubKeyFromBytes(pubkey)
-		if err != nil {
-			return nil, err
-		}
+		hashes = append(hashes, common.BytesToUint160(sender))
+	case pb.PayloadType_REGISTER_NAME_TYPE:
+		publicKey := payload.(*pb.RegisterName).Registrant
 		programhash, err := program.CreateProgramHash(publicKey)
 		if err != nil {
 			return nil, err
 		}
 		hashes = append(hashes, programhash)
-	case pb.DELETE_NAME_TYPE:
-		pubkey := payload.(*pb.DeleteName).Registrant
-		publicKey, err := crypto.NewPubKeyFromBytes(pubkey)
-		if err != nil {
-			return nil, err
-		}
+	case pb.PayloadType_TRANSFER_NAME_TYPE:
+		publicKey := payload.(*pb.TransferName).Registrant
 		programhash, err := program.CreateProgramHash(publicKey)
 		if err != nil {
 			return nil, err
 		}
 		hashes = append(hashes, programhash)
-	case pb.SUBSCRIBE_TYPE:
-		pubkey := payload.(*pb.Subscribe).Subscriber
-		publicKey, err := crypto.NewPubKeyFromBytes(pubkey)
-		if err != nil {
-			return nil, err
-		}
+	case pb.PayloadType_DELETE_NAME_TYPE:
+		publicKey := payload.(*pb.DeleteName).Registrant
 		programhash, err := program.CreateProgramHash(publicKey)
 		if err != nil {
 			return nil, err
 		}
 		hashes = append(hashes, programhash)
-	case pb.GENERATE_ID_TYPE:
-		pubkey := payload.(*pb.GenerateID).PublicKey
-		publicKey, err := crypto.NewPubKeyFromBytes(pubkey)
-		if err != nil {
-			return nil, err
-		}
+	case pb.PayloadType_SUBSCRIBE_TYPE:
+		publicKey := payload.(*pb.Subscribe).Subscriber
 		programhash, err := program.CreateProgramHash(publicKey)
 		if err != nil {
 			return nil, err
 		}
 		hashes = append(hashes, programhash)
-	case pb.NANO_PAY_TYPE:
+	case pb.PayloadType_UNSUBSCRIBE_TYPE:
+		publicKey := payload.(*pb.Unsubscribe).Subscriber
+		programhash, err := program.CreateProgramHash(publicKey)
+		if err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, programhash)
+	case pb.PayloadType_GENERATE_ID_TYPE:
+		genID := payload.(*pb.GenerateID)
+		var programhash common.Uint160
+		if len(genID.Sender) > 0 {
+			programhash = common.BytesToUint160(genID.Sender)
+		} else {
+			programhash, err = program.CreateProgramHash(genID.PublicKey)
+			if err != nil {
+				return nil, err
+			}
+		}
+		hashes = append(hashes, programhash)
+	case pb.PayloadType_NANO_PAY_TYPE:
 		sender := payload.(*pb.NanoPay).Sender
-		hashes = append(hashes, BytesToUint160(sender))
-
-	case pb.ISSUE_ASSET_TYPE:
+		hashes = append(hashes, common.BytesToUint160(sender))
+	case pb.PayloadType_ISSUE_ASSET_TYPE:
 		sender := payload.(*pb.IssueAsset).Sender
-		hashes = append(hashes, BytesToUint160(sender))
+		hashes = append(hashes, common.BytesToUint160(sender))
 	default:
 		return nil, errors.New("unsupport transaction type")
 	}
@@ -190,22 +196,17 @@ func (tx *Transaction) GetMessage() []byte {
 	return signature.GetHashData(tx)
 }
 
-func (tx *Transaction) ToArray() []byte {
-	dt, _ := tx.Marshal()
-	return dt
-}
-
-func (tx *Transaction) Hash() Uint256 {
+func (tx *Transaction) Hash() common.Uint256 {
 	if tx.hash == nil {
 		d := signature.GetHashData(tx)
 		temp := sha256.Sum256([]byte(d))
-		f := Uint256(sha256.Sum256(temp[:]))
+		f := common.Uint256(sha256.Sum256(temp[:]))
 		tx.hash = &f
 	}
 	return *tx.hash
 }
 
-func HashToShortHash(hash Uint256, salt []byte, size uint32) []byte {
+func HashToShortHash(hash common.Uint256, salt []byte, size uint32) []byte {
 	shortHash := sha256.Sum256(append(hash[:], salt...))
 	if size > sha256.Size {
 		return shortHash[:]
@@ -217,12 +218,12 @@ func (tx *Transaction) ShortHash(salt []byte, size uint32) []byte {
 	return HashToShortHash(tx.Hash(), salt, size)
 }
 
-func (tx *Transaction) SetHash(hash Uint256) {
+func (tx *Transaction) SetHash(hash common.Uint256) {
 	tx.hash = &hash
 }
 
 func (txn *Transaction) VerifySignature() error {
-	if txn.UnsignedTx.Payload.Type == pb.COINBASE_TYPE {
+	if txn.UnsignedTx.Payload.Type == pb.PayloadType_COINBASE_TYPE {
 		return nil
 	}
 
@@ -239,7 +240,7 @@ func (txn *Transaction) VerifySignature() error {
 	return nil
 }
 
-type byProgramHashes []Uint160
+type byProgramHashes []common.Uint160
 
 func (a byProgramHashes) Len() int      { return len(a) }
 func (a byProgramHashes) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
@@ -264,23 +265,25 @@ func (tx *Transaction) GetInfo() ([]byte, error) {
 		Attributes  string        `json:"attributes"`
 		Programs    []programInfo `json:"programs"`
 		Hash        string        `json:"hash"`
+		Size        uint32        `json:"size"`
 	}
 
 	tx.Hash()
 	info := &txnInfo{
 		TxType:      tx.UnsignedTx.Payload.GetType().String(),
-		PayloadData: BytesToHexString(tx.UnsignedTx.Payload.GetData()),
+		PayloadData: hex.EncodeToString(tx.UnsignedTx.Payload.GetData()),
 		Nonce:       tx.UnsignedTx.Nonce,
 		Fee:         tx.UnsignedTx.Fee,
-		Attributes:  BytesToHexString(tx.UnsignedTx.Attributes),
+		Attributes:  hex.EncodeToString(tx.UnsignedTx.Attributes),
 		Programs:    make([]programInfo, 0),
 		Hash:        tx.hash.ToHexString(),
+		Size:        tx.GetSize(),
 	}
 
 	for _, v := range tx.Programs {
 		pgInfo := &programInfo{}
-		pgInfo.Code = BytesToHexString(v.Code)
-		pgInfo.Parameter = BytesToHexString(v.Parameter)
+		pgInfo.Code = hex.EncodeToString(v.Code)
+		pgInfo.Parameter = hex.EncodeToString(v.Parameter)
 		info.Programs = append(info.Programs, *pgInfo)
 	}
 

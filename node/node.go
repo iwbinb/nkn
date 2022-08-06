@@ -5,17 +5,19 @@ import (
 	"encoding/json"
 	"net/url"
 	"sync"
+	"time"
 
-	"github.com/gogo/protobuf/jsonpb"
-	"github.com/nknorg/nkn/crypto"
-	"github.com/nknorg/nkn/pb"
+	"github.com/golang/protobuf/jsonpb"
+	"github.com/nknorg/nkn/v2/crypto"
+	"github.com/nknorg/nkn/v2/pb"
 	nnetpb "github.com/nknorg/nnet/protobuf"
 )
 
 type Node struct {
 	*nnetpb.Node
 	*pb.NodeData
-	publicKey *crypto.PubKey
+	publicKey []byte
+	startTime time.Time
 
 	sync.RWMutex
 	syncState           pb.SyncState
@@ -50,14 +52,14 @@ func (n *Node) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 
-	out["publicKey"] = hex.EncodeToString(n.NodeData.PublicKey)
+	out["publicKey"] = hex.EncodeToString(n.GetPublicKey())
 	out["syncState"] = n.GetSyncState().String()
 
 	return json.Marshal(out)
 }
 
 func NewNode(nnetNode *nnetpb.Node, nodeData *pb.NodeData) (*Node, error) {
-	publicKey, err := crypto.DecodePoint(nodeData.PublicKey)
+	err := crypto.CheckPublicKey(nodeData.PublicKey)
 	if err != nil {
 		return nil, err
 	}
@@ -65,8 +67,9 @@ func NewNode(nnetNode *nnetpb.Node, nodeData *pb.NodeData) (*Node, error) {
 	node := &Node{
 		Node:      nnetNode,
 		NodeData:  nodeData,
-		publicKey: publicKey,
-		syncState: pb.WAIT_FOR_SYNCING,
+		publicKey: nodeData.PublicKey,
+		startTime: time.Now(),
+		syncState: pb.SyncState_WAIT_FOR_SYNCING,
 	}
 
 	return node, nil
@@ -80,7 +83,7 @@ func (n *Node) GetID() string {
 	return chordIDToNodeID(n.GetChordID())
 }
 
-func (n *Node) GetPubKey() *crypto.PubKey {
+func (n *Node) GetPubKey() []byte {
 	return n.publicKey
 }
 

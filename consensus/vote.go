@@ -1,20 +1,28 @@
-package moca
+package consensus
 
 import (
 	"fmt"
+	"math"
 
-	"github.com/nknorg/nkn/common"
-	"github.com/nknorg/nkn/pb"
-	"github.com/nknorg/nkn/util/log"
+	"github.com/nknorg/nkn/v2/common"
+	"github.com/nknorg/nkn/v2/pb"
+	"github.com/nknorg/nkn/v2/util/log"
 )
 
 // receiveVote is called when a vote from neighbor is received
 func (consensus *Consensus) receiveVote(neighborID string, height uint32, blockHash common.Uint256) error {
 	log.Debugf("Receive vote %s for height %d from neighbor %v", blockHash.ToHexString(), height, neighborID)
 
+	if consensus.localNode.GetSyncState() == pb.SyncState_PERSIST_FINISHED {
+		expectedHeight := consensus.GetExpectedHeight()
+		if math.Abs(float64(height)-float64(expectedHeight)) > acceptVoteHeightRange {
+			return fmt.Errorf("receive invalid vote height %d, expecting %d +- %d", height, expectedHeight, acceptVoteHeightRange)
+		}
+	}
+
 	if blockHash != common.EmptyUint256 {
 		err := consensus.receiveProposalHash(neighborID, height, blockHash)
-		if err != nil && consensus.localNode.GetSyncState() == pb.PERSIST_FINISHED {
+		if err != nil && consensus.localNode.GetSyncState() == pb.SyncState_PERSIST_FINISHED {
 			log.Warningf("Receive block hash error when receive vote: %v", err)
 		}
 	}
@@ -24,9 +32,13 @@ func (consensus *Consensus) receiveVote(neighborID string, height uint32, blockH
 		return err
 	}
 
+	if elc.IsStopped() {
+		return nil
+	}
+
 	err = elc.ReceiveVote(neighborID, blockHash)
 	if err != nil {
-		return fmt.Errorf("reveive vote at %d for %s error: %v", height, blockHash.ToHexString(), err)
+		return fmt.Errorf("receive vote at %d for %s error: %v", height, blockHash.ToHexString(), err)
 	}
 
 	return nil
@@ -48,7 +60,7 @@ func (consensus *Consensus) vote(height uint32, blockHash common.Uint256) error 
 	for _, neighbor := range consensus.localNode.GetNeighbors(nil) {
 		err = neighbor.SendBytesAsync(buf)
 		if err != nil {
-			log.Errorf("Send vote to neighbor %v error: %v", neighbor, err)
+			log.Warningf("Send message to neighbor %v error: %v", neighbor, err)
 		}
 	}
 

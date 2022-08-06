@@ -15,20 +15,22 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nknorg/nkn/util/config"
+	"github.com/nknorg/nkn/v2/config"
 )
 
 const (
+	LogFileExt = ".log"
 	namePrefix = "LEVEL"
 	callDepth  = 2
 	mb         = 1024 * 1024
 )
 
 const (
-	Red    = "0;31"
-	Green  = "0;32"
-	Yellow = "0;33"
-	Pink   = "1;35"
+	Red     = "0;31"
+	Green   = "0;32"
+	Yellow  = "0;33"
+	Magenta = "0;35"
+	Cyan    = "0;36"
 )
 
 const (
@@ -36,15 +38,17 @@ const (
 	infoLog
 	warnLog
 	errorLog
+	fatalLog
 	maxLevelLog
 )
 
 var (
 	levels = map[int]string{
-		debugLog: Color(Pink, "[DEBUG]"),
+		debugLog: Color(Cyan, "[DEBUG]"),
 		infoLog:  Color(Green, "[INFO ]"),
 		warnLog:  Color(Yellow, "[WARN ]"),
 		errorLog: Color(Red, "[ERROR]"),
+		fatalLog: Color(Magenta, "[FATAL]"),
 	}
 	Stdout = os.Stdout
 )
@@ -63,6 +67,7 @@ func GetGID() uint64 {
 }
 
 var Log *Logger
+var WebLog *Logger
 var initOnce sync.Once
 
 func LevelName(level int) string {
@@ -107,6 +112,12 @@ func (l *Logger) reset(out io.Writer, prefix string, flag, level int, file *os.F
 	l.level = level
 	l.logger = log.New(out, prefix, flag)
 	l.logFile = file
+}
+
+func (l *Logger) GetLevel() int {
+	l.RLock()
+	defer l.RUnlock()
+	return l.level
 }
 
 func (l *Logger) SetDebugLevel(level int) error {
@@ -191,77 +202,115 @@ func (l *Logger) Errorf(format string, a ...interface{}) {
 	l.Outputf(errorLog, format, a...)
 }
 
-func Debug(a ...interface{}) {
-	Log.RLock()
-	defer Log.RUnlock()
+func (l *Logger) Fatal(a ...interface{}) {
+	l.Output(fatalLog, a...)
+}
 
-	if debugLog < Log.level {
-		return
+func (l *Logger) Fatalf(format string, a ...interface{}) {
+	l.Outputf(fatalLog, format, a...)
+}
+
+func callerLocation() string {
+	pc, file, line, ok := runtime.Caller(2)
+	if !ok {
+		return "[cannot recover runtime info]"
 	}
 
-	pc := make([]uintptr, 10)
-	runtime.Callers(2, pc)
-	f := runtime.FuncForPC(pc[0])
-	file, line := f.FileLine(pc[0])
+	f := runtime.FuncForPC(pc)
 	fileName := filepath.Base(file)
+	funcName := strings.TrimPrefix(filepath.Ext(f.Name()), ".")
 
-	nameFull := f.Name()
-	nameEnd := filepath.Ext(nameFull)
-	funcName := strings.TrimPrefix(nameEnd, ".")
+	return fmt.Sprintf("[%s:L%d %s()]", fileName, line, funcName)
+}
 
-	a = append([]interface{}{funcName + "()", fileName + ":" + strconv.Itoa(line)}, a...)
-
-	Log.Debug(a...)
+func Debug(a ...interface{}) {
+	if Log != nil && Log.GetLevel() > debugLog {
+		return
+	}
+	Log.Debug(append([]interface{}{callerLocation()}, a...)...)
 }
 
 func Debugf(format string, a ...interface{}) {
-	Log.RLock()
-	defer Log.RUnlock()
-
-	if debugLog < Log.level {
+	if Log != nil && Log.GetLevel() > debugLog {
 		return
 	}
-
-	pc := make([]uintptr, 10)
-	runtime.Callers(2, pc)
-	f := runtime.FuncForPC(pc[0])
-	file, line := f.FileLine(pc[0])
-	fileName := filepath.Base(file)
-
-	nameFull := f.Name()
-	nameEnd := filepath.Ext(nameFull)
-	funcName := strings.TrimPrefix(nameEnd, ".")
-
-	a = append([]interface{}{funcName + "()", fileName, line}, a...)
-
-	Log.Debugf("%s %s:%d "+format, a...)
+	Log.Debugf("%s "+format, append([]interface{}{callerLocation()}, a...)...)
 }
 
 func Info(a ...interface{}) {
 	Log.Info(a...)
 }
 
-func Warning(a ...interface{}) {
-	Log.Warning(a...)
-}
-
-func Error(a ...interface{}) {
-	Log.Error(a...)
-}
-
 func Infof(format string, a ...interface{}) {
 	Log.Infof(format, a...)
+}
+
+func Warning(a ...interface{}) {
+	Log.Warning(a...)
 }
 
 func Warningf(format string, a ...interface{}) {
 	Log.Warningf(format, a...)
 }
 
+func Error(a ...interface{}) {
+	Log.Error(a...)
+}
+
 func Errorf(format string, a ...interface{}) {
 	Log.Errorf(format, a...)
 }
 
-func FileOpen(path string) (*os.File, error) {
+func Fatal(a ...interface{}) {
+	Log.Fatal(append([]interface{}{callerLocation()}, a...)...)
+	os.Exit(1)
+}
+
+func Fatalf(format string, a ...interface{}) {
+	Log.Fatalf("%s "+format, append([]interface{}{callerLocation()}, a...)...)
+	os.Exit(1)
+}
+
+func PruneLogFiles(logPath string) error {
+	files, err := ioutil.ReadDir(logPath)
+	if err != nil {
+		return err
+	}
+
+	logFiles := make([]os.FileInfo, 0, len(files))
+	for _, file := range files {
+		if filepath.Ext(file.Name()) == LogFileExt {
+			logFiles = append(logFiles, file)
+		}
+	}
+
+	for left, right := 0, len(logFiles)-1; left < right; left, right = left+1, right-1 {
+		logFiles[left], logFiles[right] = logFiles[right], logFiles[left]
+	}
+
+	maxSize := int64(config.Parameters.MaxLogFileTotalSize) * mb
+	var totalSize int64
+	i := 0
+	for ; i < len(logFiles); i++ {
+		totalSize += logFiles[i].Size()
+		if totalSize > maxSize {
+			break
+		}
+	}
+
+	if i < len(logFiles) {
+		for j := i; j < len(logFiles); j++ {
+			err = os.Remove(filepath.Join(config.Parameters.LogPath, logFiles[j].Name()))
+			if err != nil {
+				log.Println("Remove old log file error:", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func OpenLogFile(path string, name string) (*os.File, error) {
 	if fi, err := os.Stat(path); err == nil {
 		if !fi.IsDir() {
 			return nil, fmt.Errorf("%s is not a directory", path)
@@ -272,16 +321,21 @@ func FileOpen(path string) (*os.File, error) {
 		}
 	}
 
-	var currenttime string = time.Now().Format("2006-01-02_15.04.05")
+	err := PruneLogFiles(path)
+	if err != nil {
+		return nil, err
+	}
 
-	logfile, err := os.OpenFile(filepath.Join(path, currenttime+"_LOG.log"), os.O_RDWR|os.O_CREATE, 0666)
+	var currentTime string = time.Now().Format("2006-01-02_15.04.05")
+
+	logfile, err := os.OpenFile(filepath.Join(path, currentTime+"_"+name+LogFileExt), os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		return nil, err
 	}
 	return logfile, nil
 }
 
-func getWritterAndFile(outputs ...interface{}) (io.Writer, *os.File, error) {
+func getWritterAndFile(name string, outputs ...interface{}) (io.Writer, *os.File, error) {
 	writers := []io.Writer{}
 	var logFile *os.File
 	var err error
@@ -291,7 +345,7 @@ func getWritterAndFile(outputs ...interface{}) (io.Writer, *os.File, error) {
 		for _, o := range outputs {
 			switch o.(type) {
 			case string:
-				logFile, err = FileOpen(o.(string))
+				logFile, err = OpenLogFile(o.(string), name)
 				if err != nil {
 					return nil, nil, fmt.Errorf("open log file %v failed: %v", o, err)
 				}
@@ -310,24 +364,38 @@ func getWritterAndFile(outputs ...interface{}) (io.Writer, *os.File, error) {
 func Init() error {
 	var err error
 	initOnce.Do(func() {
-		var writter io.Writer
-		var file *os.File
-		writter, file, err = getWritterAndFile(config.Parameters.LogPath, Stdout)
+		var writter, webWritter io.Writer
+		var file, webFile *os.File
+		writter, file, err = getWritterAndFile("LOG", config.Parameters.LogPath, Stdout)
+		if err != nil {
+			return
+		}
+		webWritter, webFile, err = getWritterAndFile("WEBLOG", config.Parameters.LogPath)
 		if err != nil {
 			return
 		}
 
 		Log = newLogger(writter, "", log.Ldate|log.Lmicroseconds, config.Parameters.LogLevel, file)
+		WebLog = newLogger(webWritter, "", log.Ldate|log.Lmicroseconds, config.Parameters.LogLevel, webFile)
 
 		go func() {
 			for {
 				time.Sleep(config.ConsensusDuration)
 				if Log.needNewLogFile() {
-					writter, file, err = getWritterAndFile(config.Parameters.LogPath, Stdout)
+					writter, file, err = getWritterAndFile("LOG", config.Parameters.LogPath, Stdout)
 					if err != nil {
-						panic(err)
+						log.Println(err)
+						os.Exit(1)
 					}
 					Log.reset(writter, "", log.Ldate|log.Lmicroseconds, config.Parameters.LogLevel, file)
+				}
+				if WebLog.needNewLogFile() {
+					writter, file, err = getWritterAndFile("WEBLOG", config.Parameters.LogPath)
+					if err != nil {
+						log.Println(err)
+						os.Exit(1)
+					}
+					WebLog.reset(writter, "", log.Ldate|log.Lmicroseconds, config.Parameters.LogLevel, file)
 				}
 			}
 		}()

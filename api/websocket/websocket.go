@@ -1,29 +1,30 @@
 package websocket
 
 import (
+	"encoding/hex"
 	"encoding/json"
 
-	"github.com/nknorg/nkn/api/common"
-	"github.com/nknorg/nkn/api/websocket/server"
-	"github.com/nknorg/nkn/block"
-	"github.com/nknorg/nkn/chain"
-	. "github.com/nknorg/nkn/common"
-	"github.com/nknorg/nkn/event"
-	"github.com/nknorg/nkn/node"
-	"github.com/nknorg/nkn/util/config"
-	"github.com/nknorg/nkn/util/log"
-	"github.com/nknorg/nkn/vault"
+	"github.com/nknorg/nkn/v2/api/common"
+	"github.com/nknorg/nkn/v2/api/common/errcode"
+	"github.com/nknorg/nkn/v2/api/websocket/server"
+	"github.com/nknorg/nkn/v2/block"
+	"github.com/nknorg/nkn/v2/chain"
+	"github.com/nknorg/nkn/v2/config"
+	"github.com/nknorg/nkn/v2/event"
+	"github.com/nknorg/nkn/v2/node"
+	"github.com/nknorg/nkn/v2/util/log"
+	"github.com/nknorg/nkn/v2/vault"
 )
 
 var ws *server.WsServer
 
 var (
-	pushBlockFlag    bool = true
+	pushBlockFlag    bool = false
 	pushRawBlockFlag bool = false
 	pushBlockTxsFlag bool = false
 )
 
-func NewServer(localNode *node.LocalNode, w vault.Wallet) *server.WsServer {
+func NewServer(localNode *node.LocalNode, w *vault.Wallet) *server.WsServer {
 	//	common.SetNode(n)
 	event.Queue.Subscribe(event.NewBlockProduced, SendBlock2WSclient)
 	ws = server.InitWsServer(localNode, w)
@@ -75,11 +76,11 @@ func PushBlock(v interface{}) {
 	if ws == nil {
 		return
 	}
-	resp := common.ResponsePack(common.SUCCESS)
+	resp := common.ResponsePack(errcode.SUCCESS)
 	if block, ok := v.(*block.Block); ok {
 		if pushRawBlockFlag {
 			dt, _ := block.Marshal()
-			resp["Result"] = BytesToHexString(dt)
+			resp["Result"] = hex.EncodeToString(dt)
 		} else {
 			info, _ := block.GetInfo()
 			var x interface{}
@@ -95,7 +96,7 @@ func PushBlockTransactions(v interface{}) {
 	if ws == nil {
 		return
 	}
-	resp := common.ResponsePack(common.SUCCESS)
+	resp := common.ResponsePack(errcode.SUCCESS)
 	if block, ok := v.(*block.Block); ok {
 		if pushBlockTxsFlag {
 			resp["Result"] = common.GetBlockTransactions(block)
@@ -109,16 +110,16 @@ func PushSigChainBlockHash(v interface{}) {
 	if ws == nil {
 		return
 	}
-	resp := common.ResponsePack(common.SUCCESS)
+	resp := common.ResponsePack(errcode.SUCCESS)
 	if block, ok := v.(*block.Block); ok {
-		sigChainBlockHeight := block.Header.UnsignedHeader.Height - config.MaxRollbackBlocks
+		sigChainBlockHeight := block.Header.UnsignedHeader.Height - config.SigChainBlockDelay
 		sigChainBlockHash, err := chain.DefaultLedger.Store.GetBlockHash(sigChainBlockHeight)
 		if err != nil {
 			log.Warningf("get sigchain block hash at height %d error: %v", sigChainBlockHeight, err)
 			return
 		}
 		resp["Action"] = "updateSigChainBlockHash"
-		resp["Result"] = BytesToHexString(sigChainBlockHash.ToArray())
+		resp["Result"] = hex.EncodeToString(sigChainBlockHash.ToArray())
 		ws.PushResult(resp)
 	}
 }

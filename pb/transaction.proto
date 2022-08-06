@@ -1,19 +1,7 @@
 syntax = "proto3";
+option go_package = "./pb";
 
 package pb;
-
-import "github.com/gogo/protobuf/gogoproto/gogo.proto";
-
-option (gogoproto.gostring_all) = true;
-option (gogoproto.goproto_stringer_all) = false;
-option (gogoproto.stringer_all) = true;
-option (gogoproto.marshaler_all) = true;
-option (gogoproto.sizer_all) = true;
-option (gogoproto.unmarshaler_all) = true;
-
-option (gogoproto.testgen_all) = true;
-option (gogoproto.equal_all) = true;
-option (gogoproto.populate_all) = true;
 
 message UnsignedTx {
 	Payload   payload    = 1;
@@ -44,6 +32,7 @@ enum PayloadType {
 	GENERATE_ID_TYPE    = 8;
 	NANO_PAY_TYPE       = 9;
 	ISSUE_ASSET_TYPE    = 10;
+	GENERATE_ID_2_TYPE  = 11;
 }
 
 message Payload {
@@ -58,13 +47,20 @@ message Coinbase {
 }
 
 message SigChainTxn {
-	bytes sigChain     = 1;
+	bytes sig_chain    = 1;
 	bytes submitter    = 2;
 }
 
 message RegisterName {
-	bytes  registrant = 1;
-	string name       = 2;
+	bytes  registrant      = 1;
+	string name            = 2;
+	int64 registration_fee = 3;
+}
+
+message TransferName {
+	string name            = 1;
+	bytes registrant       = 2;
+	bytes recipient        = 3;
 }
 
 message DeleteName {
@@ -76,9 +72,15 @@ message Subscribe {
 	bytes subscriber   = 1;
 	string identifier  = 2;
 	string topic       = 3;
-	uint32 bucket      = 4;
+	uint32 bucket      = 4 [deprecated = true];
 	uint32 duration    = 5;
-	string meta        = 6;
+	bytes meta         = 6;
+}
+
+message Unsubscribe {
+	bytes subscriber   = 1;
+	string identifier  = 2;
+	string topic       = 3;
 }
 
 message TransferAsset {
@@ -90,6 +92,8 @@ message TransferAsset {
 message GenerateID {
 	bytes public_key       = 1;
 	int64 registration_fee = 2;
+	bytes sender           = 3;
+	int32 version          = 4;
 }
 
 message NanoPay {

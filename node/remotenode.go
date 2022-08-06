@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/nknorg/nkn/pb"
+	"github.com/golang/protobuf/proto"
+	"github.com/nknorg/nkn/v2/pb"
 	nnetnode "github.com/nknorg/nnet/node"
 )
 
@@ -18,7 +18,8 @@ type RemoteNode struct {
 	sharedKey *[sharedKeySize]byte
 
 	sync.RWMutex
-	height uint32
+	height         uint32
+	lastUpdateTime time.Time
 }
 
 func (remoteNode *RemoteNode) MarshalJSON() ([]byte, error) {
@@ -37,6 +38,7 @@ func (remoteNode *RemoteNode) MarshalJSON() ([]byte, error) {
 	out["height"] = remoteNode.GetHeight()
 	out["isOutbound"] = remoteNode.nnetNode.IsOutbound
 	out["roundTripTime"] = remoteNode.nnetNode.GetRoundTripTime() / time.Millisecond
+	out["connTime"] = time.Since(remoteNode.Node.startTime) / time.Second
 
 	return json.Marshal(out)
 }
@@ -83,10 +85,26 @@ func (remoteNode *RemoteNode) SetHeight(height uint32) {
 	remoteNode.height = height
 }
 
+func (remoteNode *RemoteNode) GetLastUpdateTime() time.Time {
+	remoteNode.RLock()
+	defer remoteNode.RUnlock()
+	return remoteNode.lastUpdateTime
+}
+
+func (remoteNode *RemoteNode) SetLastUpdateTime(lastUpdateTime time.Time) {
+	remoteNode.Lock()
+	defer remoteNode.Unlock()
+	remoteNode.lastUpdateTime = lastUpdateTime
+}
+
 func (remoteNode *RemoteNode) CloseConn() {
 	remoteNode.nnetNode.Stop(nil)
 }
 
 func (remoteNode *RemoteNode) String() string {
 	return remoteNode.nnetNode.String()
+}
+
+func (remoteNode *RemoteNode) IsStopped() bool {
+	return remoteNode.nnetNode.IsStopped()
 }
