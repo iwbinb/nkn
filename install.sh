@@ -1,13 +1,9 @@
 #!/bin/sh
-NKN 一键安装Github
+# NKN 一键安装Github
 
 sudo su
+cd /home/ubuntu/
 sudo apt update
-sudo fallocate -l 1G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
-echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 sudo apt install unzip
 wget https://commercial.nkn.org/downloads/nkn-commercial/linux-amd64.zip
 unzip linux-amd64.zip 
